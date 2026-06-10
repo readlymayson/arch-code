@@ -1,18 +1,17 @@
 import os
 
-from crewai import Agent, Crew, Process, Task
+from crewai import Agent, Crew, LLM, Process, Task
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 
 from tools.coding_tool import LangGraphCodingTool
 from tools.knowledge_reader import ReadKnowledgeTool
 
 load_dotenv()
 
-pro_llm = ChatOpenAI(
-    model="deepseek-v4-pro",
+pro_llm = LLM(
+    model="deepseek-chat",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
+    base_url="https://api.deepseek.com/v1",
 )
 
 knowledge_tool = ReadKnowledgeTool()

@@ -4,6 +4,10 @@ from pydantic import BaseModel, Field
 from graph_worker import coding_graph
 
 
+def _sanitize(text: str) -> str:
+    return text.encode("cp1251", errors="replace").decode("cp1251")
+
+
 class CodeGenerationInput(BaseModel):
     task_description: str = Field(
         ..., description="Детальное ТЗ для написания кода на Node.js."
@@ -40,13 +44,13 @@ class LangGraphCodingTool(BaseTool):
         final_state = coding_graph.invoke(initial_state)
 
         if final_state["success"]:
-            msg = "✅ Код успешно написан и протестирован!"
+            msg = "[OK] Code generated and tested!"
             if test_code:
-                msg += " (тест пройден)"
-            return f"{msg}\n\nКод:\n{final_state['code']}"
+                msg += " (test passed)"
+            return _sanitize(f"{msg}\n\nCode:\n{final_state['code']}")
         else:
-            return (
-                f"❌ Не удалось выполнить задачу за {final_state['iterations']} итераций.\n"
-                f"Последняя ошибка: {final_state['error']}\n\n"
-                f"Последняя версия кода:\n{final_state['code']}"
+            return _sanitize(
+                f"[FAIL] Task failed after {final_state['iterations']} iterations.\n"
+                f"Last error: {final_state['error']}\n\n"
+                f"Last code version:\n{final_state['code']}"
             )
