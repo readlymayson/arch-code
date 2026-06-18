@@ -9,7 +9,7 @@
 ### Архитектура (кратко)
 
 ```
-CrewAI (Architect Agent, DeepSeek-V4-Pro)
+CrewAI (Architect Agent, DeepSeek-V4-Flash)
   └─ LangGraphCodingTool (CrewAI Tool)
        └─ LangGraph (generate → test → (max 3 iters) → END)
             └─ Docker Sandbox (node:18-alpine)
@@ -25,14 +25,14 @@ CrewAI (Architect Agent, DeepSeek-V4-Pro)
 |---|---|
 | Оркестратор агентов | CrewAI |
 | Граф состояний | LangGraph + LangChain |
-| LLM | DeepSeek-V4-Pro (архитектор), DeepSeek-V4-Flash (кодер) |
+| LLM | DeepSeek-V4-Flash (архитектор и кодер) |
 | Песочница | Docker SDK для Python, образ `node:18-alpine` |
 | Валидация | `crewai>=0.30.0`, `langgraph>=0.0.50`, `docker>=7.0.0` |
 
 ### Модели
 
-- **Архитектор** (`deepseek-v4-pro`) — медленнее, умнее; пишет ТЗ, декомпозирует задачи.
-- **Кодер** (`deepseek-v4-flash`) — быстрее; генерирует/исправляет код внутри LangGraph-цикла.
+- **Архитектор** (`deepseek-v4-flash`) — генерирует ТЗ, декомпозирует задачи.
+- **Кодер** (`deepseek-v4-flash`) — генерирует/исправляет код внутри LangGraph-цикла.
 
 ---
 
@@ -40,7 +40,8 @@ CrewAI (Architect Agent, DeepSeek-V4-Pro)
 
 ```
 arch-code/
-├── main.py                  # Точка входа — запуск CrewAI пайплайна
+├── main.py                  # Точка входа — CrewAI пайплайн (пакетный режим)
+├── chat.py                  # Точка входа — интерактивный чат (рекомендовано)
 ├── graph_worker.py          # LangGraph-граф: генерация → тест → исправление
 ├── docker_manager.py        # Класс NodeSandbox — Docker-песочница для Node.js
 ├── tools/
@@ -69,6 +70,13 @@ pip install -r requirements.txt
 ### Запуск
 
 ```bash
+# Интерактивный чат с AI-архитектором (рекомендовано)
+python chat.py
+
+# Однострочная задача
+python chat.py "напиши Express сервер с GET /health"
+
+# Пакетный режим (задача жёстко задана в main.py)
 python main.py
 ```
 
@@ -92,11 +100,29 @@ python -c "from docker_manager import NodeSandbox; ns = NodeSandbox(); print(ns.
 
 ## Ключевые файлы и их устройство
 
-### `main.py` — CrewAI оркестратор
+### `main.py` — CrewAI оркестратор (пакетный режим)
 
 Создаёт одного **Architect Agent**, даёт ему инструменты `ReadProjectDocs` и `LangGraphCodingTool`, после чего запускает `Crew.kickoff()`.
 
 **Важно:** Описание задачи (объект `Task`) нужно менять под конкретный кейс — проект не содержит готовой логики, это каркас.
+
+### `chat.py` — CrewAI оркестратор (интерактивный чат) 🆕
+
+То же ядро, что и `main.py`, но с тремя ключевыми отличиями:
+
+**Multi-turn:** `ChatArchitect` хранит ручной буфер контекста (без CrewAI Memory):
+- Последние 3 пары реплик (User/Architect)
+- Последний сгенерированный код (обрезанный до 50 строк)
+- Список файлов в `sandbox/`
+
+**Streaming:** `Crew(stream=True)` — токены выводятся в реальном времени.  
+Пользователь видит мысли архитектора и вызовы инструментов (🔧) по мере выполнения.
+
+**Команды:** `/code` (последний код), `/sandbox` (файлы), `/docs` (knowledge/), `/exit`, `/help`, `/clear`.
+
+**Однострочный режим:** `python chat.py "задача одной строкой"` — без интерактива.
+
+**Контекст не лавинообразный:** старые реплики вытесняются, код обрезается — экономия токенов не за счёт качества.
 
 ### `graph_worker.py` — LangGraph-цикл
 
@@ -166,6 +192,16 @@ API-контракты для webhook (Twilio-совместимый) и схе�
 - Тесты: встроенный `node:test` (Node 18+), запускаются в Docker через `node --test`.
 
 ### Процесс разработки через систему
+
+#### Вариант А: Чат (рекомендовано)
+
+1. Запуск: `python chat.py`
+2. Пользователь пишет задачу на естественном языке.
+3. Architect читает docs, формирует ТЗ, вызывает `LangGraphCodingTool`.
+4. Код генерируется, тестируется в Docker, результат сохраняется в `sandbox/`.
+5. Пользователь может уточнить задачу — контекст сохраняется между сообщениями.
+
+#### Вариант Б: Пакетный режим
 
 1. Архитектор читает `knowledge/style-guide.md` и `knowledge/api-contracts.md`.
 2. Пользователь правит `Task.description` в `main.py`.

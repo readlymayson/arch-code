@@ -8,8 +8,8 @@ from tools.knowledge_reader import ReadKnowledgeTool
 
 load_dotenv()
 
-pro_llm = LLM(
-    model="deepseek-chat",
+architect_llm = LLM(
+    model="deepseek-v4-flash",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1",
 )
@@ -35,7 +35,7 @@ def main():
         ),
         verbose=True,
         allow_delegation=False,
-        llm=pro_llm,
+        llm=architect_llm,
         tools=[knowledge_tool, coding_tool],
     )
 

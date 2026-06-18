@@ -12,7 +12,7 @@ from docker_manager import NodeSandbox
 load_dotenv()
 
 flash_llm = ChatOpenAI(
-    model="deepseek-chat",
+    model="deepseek-v4-flash",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1",
 )
