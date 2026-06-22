@@ -52,14 +52,17 @@ class ChatArchitect:
     # ── Вспомогательные методы ────────────────────────────────────
 
     def _get_sandbox_files(self) -> list[str]:
-        """Возвращает список .js файлов в sandbox/."""
+        """Возвращает список .js файлов в sandbox/ (рекурсивно по task_id)."""
         sandbox_dir = os.path.join(os.path.dirname(__file__), "sandbox")
         if not os.path.isdir(sandbox_dir):
             return []
-        return sorted(
-            f for f in os.listdir(sandbox_dir)
-            if f.endswith(".js") and os.path.isfile(os.path.join(sandbox_dir, f))
-        )
+        files = []
+        for root, _dirs, fnames in os.walk(sandbox_dir):
+            for f in fnames:
+                if f.endswith(".js"):
+                    rel = os.path.relpath(os.path.join(root, f), sandbox_dir)
+                    files.append(rel)
+        return sorted(files)
 
     def _truncate_code(self, code: str, max_lines: int = MAX_CODE_PREVIEW_LINES) -> str:
         """Обрезает код до max_lines строк, если он слишком длинный."""

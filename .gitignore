@@ -27,3 +27,7 @@ sandbox/
 # OS
 .DS_Store
 Thumbs.db
+
+# Virtual environment (venv)
+venv/
+logs/
