@@ -76,32 +76,39 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
     Returns:
         Список словарей: [{"path": "adapters/vk.py", "diff": "...", "status": "modified"}, ...]
     """
+    timeout = 30  # единый таймаут на git-операции
+
     try:
         # Инициализируем git, если ещё нет
         subprocess.run(
             ["git", "init", "--initial-branch=main"],
             cwd=sandbox_dir, check=True, capture_output=True,
+            timeout=timeout,
         )
         # Настраиваем user для коммита (чтобы git не ругался)
         subprocess.run(
             ["git", "config", "user.email", "arch-code@ai.local"],
             cwd=sandbox_dir, check=True, capture_output=True,
+            timeout=timeout,
         )
         subprocess.run(
             ["git", "config", "user.name", "Arch Code Agent"],
             cwd=sandbox_dir, check=True, capture_output=True,
+            timeout=timeout,
         )
 
         # add всех файлов
         subprocess.run(
             ["git", "add", "-A"],
             cwd=sandbox_dir, check=True, capture_output=True,
+            timeout=timeout,
         )
 
         # Статус (нужен для списка изменённых файлов)
         status_result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=sandbox_dir, check=True, capture_output=True, text=True,
+            timeout=timeout,
         )
 
         changed = []
@@ -125,6 +132,7 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
             diff_result = subprocess.run(
                 ["git", "diff", "--no-color", "--", filename],
                 cwd=sandbox_dir, capture_output=True, text=True,
+                timeout=timeout,
             )
             # Если файл новый — показываем его содержимое
             if not diff_result.stdout and status == "added":

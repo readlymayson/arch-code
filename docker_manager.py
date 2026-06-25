@@ -179,6 +179,15 @@ class ProjectSandbox:
     соответствующие тесты (pytest / npm test).
     """
 
+    def __init__(self, task_id: str | None = None):
+        """Опциональный конструктор для обратной совместимости.
+
+        Если код вызывает ProjectSandbox(task_id=...), конструктор
+        сохраняет task_id, но не требует обязательных аргументов.
+        """
+        self.task_id = task_id or "default"
+        self.sandbox_dir: str | None = None
+
     @staticmethod
     def detect_project_type(sandbox_dir: str) -> str:
         """Определить тип проекта по наличию конфигурационных файлов."""
