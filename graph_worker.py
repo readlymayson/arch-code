@@ -205,18 +205,8 @@ def test_code(state: AgentState):
     """Запустить тесты проекта в Docker-контейнере."""
     sandbox_dir = state["sandbox_dir"]
 
-    # Определяем тип проекта
-    has_requirements = os.path.exists(os.path.join(sandbox_dir, "requirements.txt"))
-    has_package_json = os.path.exists(os.path.join(sandbox_dir, "package.json"))
-    has_pyproject = os.path.exists(os.path.join(sandbox_dir, "pyproject.toml"))
-    has_setup_py = os.path.exists(os.path.join(sandbox_dir, "setup.py"))
-
-    if has_requirements or has_pyproject or has_setup_py:
-        sandbox_type = "python"
-    elif has_package_json:
-        sandbox_type = "node"
-    else:
-        sandbox_type = "unknown"
+    # Определяем тип проекта через штатный метод ProjectSandbox
+    sandbox_type = ProjectSandbox.detect_project_type(sandbox_dir)
 
     # Устанавливаем зависимости и запускаем тесты
     try:
