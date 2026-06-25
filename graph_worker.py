@@ -204,7 +204,6 @@ def execute_actions(state: AgentState):
 def test_code(state: AgentState):
     """Запустить тесты проекта в Docker-контейнере."""
     sandbox_dir = state["sandbox_dir"]
-    sandbox = ProjectSandbox(task_id=state.get("task_id", "default"))
 
     # Определяем тип проекта
     has_requirements = os.path.exists(os.path.join(sandbox_dir, "requirements.txt"))
@@ -221,7 +220,7 @@ def test_code(state: AgentState):
 
     # Устанавливаем зависимости и запускаем тесты
     try:
-        result = sandbox.run_project_tests(sandbox_dir, sandbox_type)
+        result = ProjectSandbox.run_project_tests(sandbox_dir, sandbox_type)
     except Exception as e:
         return {
             "success": False,

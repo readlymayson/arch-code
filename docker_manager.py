@@ -233,7 +233,6 @@ class ProjectSandbox:
                 remove=True,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
         except Exception:
             pass  # Если нет requirements — не страшно
@@ -248,12 +247,11 @@ class ProjectSandbox:
                 remove=True,
                 stderr=True,
                 stdout=True,
-                timeout=60,
             )
         except Exception:
             pass
 
-        # Запускаем pytest
+        # Запускаем pytest (c Docker SDK >=7 timeout перенесён в decode)
         try:
             logs = client.containers.run(
                 "python:3.12-slim",
@@ -263,7 +261,6 @@ class ProjectSandbox:
                 remove=True,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
             output = logs.decode("utf-8")
             # Считаем успехом, если нет ошибок или тесты не найдены
@@ -293,7 +290,6 @@ class ProjectSandbox:
                 remove=True,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
         except docker.errors.ContainerError:
             pass
@@ -310,7 +306,6 @@ class ProjectSandbox:
                 remove=True,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
             output = logs.decode("utf-8")
             return {"status": "success", "output": output[-1000:]}

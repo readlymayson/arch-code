@@ -31,3 +31,5 @@ Thumbs.db
 # Virtual environment (venv)
 venv/
 logs/
+=0.7.0
+=1.15.0

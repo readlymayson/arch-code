@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from pathlib import Path
 
 # Добавляем корень arch-code в sys.path, чтобы RQ мог импортировать worker
@@ -50,6 +51,18 @@ def start_worker() -> int:
     """Запустить RQ-воркер для очереди coding_tasks."""
     _setup_logger()
 
+    # ── Глобальный перехватчик необработанных исключений ────
+    # Чтобы systemd видел не «exit code 1», а осмысленный трейсбек в stderr.
+    def _global_exception_hook(exc_type, exc_value, exc_tb):
+        import traceback
+        logger.critical(
+            "Необработанное исключение в воркере:\n"
+            + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _global_exception_hook
+
     redis_url = get_redis_url()
     logger.info(f"=== Запуск фонового воркера кода (arch-code) ===")
     logger.info(f"Redis: {redis_url}")
@@ -64,10 +77,41 @@ def start_worker() -> int:
         logger.error(f"Не удалось подключиться к Redis ({redis_url}): {exc}")
         return 1
 
+    # ── Уникальное имя воркера ───────────────────────────────────
+    # Включаем hostname + PID, чтобы исключить коллизии между
+    # запусками (systemd restart, ручной kill, duplicate instance).
+    import socket
+    hostname = socket.gethostname()
+    worker_name = f"arch-code-worker-{hostname}-{os.getpid()}"
+
+    # ── Очищаем stale-воркеров с тем же шаблоном ─────────────────
+    # Если предыдущий воркер упал жёстко (kill -9) и не успел
+    # отписаться, его ключи висят в Redis. Новый воркер не сможет
+    # зарегистрироваться под тем же именем — вычищаем все.
+    try:
+        stale_keys = redis_conn.keys("rq:worker:arch-code-worker*")
+        if stale_keys:
+            redis_conn.delete(*stale_keys)
+            logger.warning(f"Очищено {len(stale_keys)} stale-ключей воркера из Redis")
+    except Exception as exc:
+        logger.warning(f"Не удалось очистить stale-ключи: {exc}")
+
     queues = [Queue("coding_tasks", connection=redis_conn)]
 
-    worker = Worker(queues, connection=redis_conn, name="arch-code-worker")
-    logger.info(f"Воркер запущен. Ожидание задач в очереди 'coding_tasks'...")
+    worker = Worker(queues, connection=redis_conn, name=worker_name)
+
+    # ── Перехватчик ошибок RQ (падение при выполнении задачи) ──
+    def _exception_handler(job, exc_type, exc_value, exc_tb):
+        logger.error(
+            f"❌ Ошибка при выполнении задачи {job.id}: {exc_value}\n"
+            + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        )
+        # Вызываем дефолтный обработчик RQ (чтобы задача ушла в failed)
+        return True
+
+    worker.push_exc_handler(_exception_handler)
+
+    logger.info(f"Воркер '{worker_name}' запущен. Ожидание задач...")
     worker.work(with_scheduler=True)
 
     return 0
