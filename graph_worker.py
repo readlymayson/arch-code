@@ -26,7 +26,7 @@ def _get_llm() -> ChatOpenAI:
     global _flash_llm
     if _flash_llm is None:
         _flash_llm = ChatOpenAI(
-            model="routerai/deepseek-v4-flash",
+            model="deepseek/deepseek-v4-flash",
             api_key=os.getenv("ROUTERAI_API_KEY"),
             base_url="https://api.routerai.com/v1",
         )
