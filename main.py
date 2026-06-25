@@ -9,9 +9,9 @@ from tools.knowledge_reader import ReadKnowledgeTool
 load_dotenv()
 
 architect_llm = LLM(
-    model="deepseek-v4-flash",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com/v1",
+    model="routerai/deepseek-v4-flash",
+    api_key=os.getenv("ROUTERAI_API_KEY"),
+    base_url="https://api.routerai.com/v1",
 )
 
 knowledge_tool = ReadKnowledgeTool()

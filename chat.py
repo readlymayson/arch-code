@@ -37,9 +37,9 @@ class ChatArchitect:
 
     def __init__(self):
         self.llm = LLM(
-            model="deepseek-v4-flash",
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com/v1",
+            model="routerai/deepseek-v4-flash",
+            api_key=os.getenv("ROUTERAI_API_KEY"),
+            base_url="https://api.routerai.com/v1",
         )
         self.knowledge_tool = ReadKnowledgeTool()
         self.coding_tool = LangGraphCodingTool()
