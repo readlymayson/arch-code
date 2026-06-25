@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import traceback
 from pathlib import Path
@@ -54,7 +55,6 @@ def start_worker() -> int:
     # ── Глобальный перехватчик необработанных исключений ────
     # Чтобы systemd видел не «exit code 1», а осмысленный трейсбек в stderr.
     def _global_exception_hook(exc_type, exc_value, exc_tb):
-        import traceback
         logger.critical(
             "Необработанное исключение в воркере:\n"
             + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -80,7 +80,6 @@ def start_worker() -> int:
     # ── Уникальное имя воркера ───────────────────────────────────
     # Включаем hostname + PID, чтобы исключить коллизии между
     # запусками (systemd restart, ручной kill, duplicate instance).
-    import socket
     hostname = socket.gethostname()
     worker_name = f"arch-code-worker-{hostname}-{os.getpid()}"
 
