@@ -9,13 +9,54 @@ Docker тестирует весь проект, на выходе — спис�
   - напрямую из main.py и chat.py
 """
 
+import asyncio
 import os
+import signal
 import subprocess
+import sys
 import uuid
 from typing import Any, Dict, Optional
 
 from graph_worker import coding_graph
 from tools.file_tools import RSYNC_EXCLUDE_PATTERNS
+
+
+# ── Флаг graceful shutdown ──────────────────────────────────────
+_shutdown_requested = False
+
+
+def _handle_sigterm(signum, frame):
+    """Обработчик SIGTERM — устанавливает флаг для graceful shutdown.
+
+    RQ посылает SIGTERM при stop-job, даёт ~1-2 секунды до SIGKILL.
+    Флаг проверяется в try/finally, finally успевает выполниться.
+    """
+    global _shutdown_requested
+    _shutdown_requested = True
+    # Восстанавливаем дефолтный обработчик — повторный SIGTERM/SIGKILL
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+# ── Job meta helper ──────────────────────────────────────────────
+
+def _update_job_meta(**updates):
+    """Обновить job.meta для текущей задачи (step tracking).
+
+    Вызывается из execute_coding_task_sync для отправки прогресса
+    в Redis, который будет прочитан get_task_status() в ai-core.
+    """
+    try:
+        from rq.job import get_current_job
+        job = get_current_job()
+        if job is None:
+            return
+        meta = dict(job.meta or {})
+        meta.update(updates)
+        meta["_updated_at"] = __import__("time").time()
+        job.meta = meta
+        job.save_meta()
+    except Exception:
+        pass  # Job meta — опционально, не должно ломать воркер
 
 
 # ── Константы ────────────────────────────────────────────────────
@@ -201,6 +242,13 @@ def execute_coding_task_sync(
     """
 
     # ═══════════════════════════════════════════════════════════
+    # 0. Регистрируем обработчик SIGTERM (graceful shutdown)
+    # ═══════════════════════════════════════════════════════════
+    global _shutdown_requested
+    _shutdown_requested = False
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    # ═══════════════════════════════════════════════════════════
     # 1. Инициализация
     # ═══════════════════════════════════════════════════════════
 
@@ -210,7 +258,9 @@ def execute_coding_task_sync(
     # ═══════════════════════════════════════════════════════════
     # 1b. Синхронизация проекта в песочницу
     # ═══════════════════════════════════════════════════════════
+
     try:
+        _update_job_meta(current_step="sync", progress=5, iteration=0)
         sandbox_dir = sync_project_to_sandbox(actual_task_id, project_dir)
     except Exception as exc:
         return _make_result(
@@ -219,62 +269,133 @@ def execute_coding_task_sync(
             error=f"Не удалось скопировать проект в sandbox: {exc}",
         )
 
-    initial_state = {
-        "task_id": actual_task_id,
-        "sandbox_dir": sandbox_dir,
-        "project_dir": project_dir or DEFAULT_SOURCE_PROJECT,
-        "task": task_description,
-        "code": "",
-        "test_code": test_code or "",
-        "test_passed": False,
-        "error": "",
-        "iterations": 0,
-        "success": False,
-        "changed_files": [],
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # 2. Запуск графа (синхронный)
-    # ═══════════════════════════════════════════════════════════
-
+    # ── try/finally гарантирует очистку ресурсов ──────────────
     try:
-        final_state = coding_graph.invoke(initial_state)
-    except Exception as exc:
-        return _make_result(
-            "error",
-            actual_task_id,
-            error=f"Критический сбой графа: {exc}",
-        )
 
-    # ═══════════════════════════════════════════════════════════
-    # 3. Вычисление git diff после работы агента
-    # ═══════════════════════════════════════════════════════════
+        initial_state = {
+            "task_id": actual_task_id,
+            "sandbox_dir": sandbox_dir,
+            "project_dir": project_dir or DEFAULT_SOURCE_PROJECT,
+            "task": task_description,
+            "code": "",
+            "test_code": test_code or "",
+            "test_passed": False,
+            "error": "",
+            "iterations": 0,
+            "success": False,
+            "changed_files": [],
+        }
 
-    changed_files = compute_sandbox_diff(sandbox_dir)
+        # ═══════════════════════════════════════════════════════
+        # 2. Запуск графа с step tracking
+        # ═══════════════════════════════════════════════════════
 
-    sandbox_path = f"sandbox/{actual_task_id}/"
+        _update_job_meta(current_step="explore", progress=10, iteration=1)
 
-    if final_state.get("success"):
-        return _make_result(
-            "success",
-            actual_task_id,
-            iterations=final_state.get("iterations"),
-            code=final_state.get("code", ""),
-            changed_files=changed_files,
-            generated_files_dir=sandbox_path,
-            log=f"Код успешно сгенерирован. Изменено файлов: {len(changed_files)}.",
-        )
-    else:
-        return _make_result(
-            "failed",
-            actual_task_id,
-            iterations=final_state.get("iterations"),
-            changed_files=changed_files,
-            error=final_state.get(
+        try:
+            final_state = coding_graph.invoke(initial_state)
+        except Exception as exc:
+            return _make_result(
                 "error",
-                "Превышено максимальное число итераций (3) без успеха.",
-            ),
-        )
+                actual_task_id,
+                error=f"Критический сбой графа: {exc}",
+            )
+
+        # Обновляем прогресс после графа
+        iterations = final_state.get("iterations", 0)
+        _update_job_meta(current_step="compute_diff", progress=90, iteration=iterations)
+
+        # ═══════════════════════════════════════════════════════
+        # 3. Вычисление git diff после работы агента
+        # ═══════════════════════════════════════════════════════
+
+        changed_files = compute_sandbox_diff(sandbox_dir)
+
+        sandbox_path = f"sandbox/{actual_task_id}/"
+
+        _update_job_meta(current_step="done", progress=100)
+
+        if final_state.get("success"):
+            return _make_result(
+                "success",
+                actual_task_id,
+                iterations=final_state.get("iterations"),
+                code=final_state.get("code", ""),
+                changed_files=changed_files,
+                generated_files_dir=sandbox_path,
+                log=f"Код успешно сгенерирован. Изменено файлов: {len(changed_files)}.",
+            )
+        else:
+            return _make_result(
+                "failed",
+                actual_task_id,
+                iterations=final_state.get("iterations"),
+                changed_files=changed_files,
+                error=final_state.get(
+                    "error",
+                    "Превышено максимальное число итераций (3) без успеха.",
+                ),
+            )
+
+    finally:
+        # ═══════════════════════════════════════════════════════
+        # Публикация в Pub/Sub: уведомляем ai-core о завершении
+        # ═══════════════════════════════════════════════════════
+        # ВАЖНО: публикуем ДО очистки sandbox, чтобы ai-core
+        # успел прочитать файлы для create_transactional_patch()
+        try:
+            _publish_result_notification(actual_task_id)
+        except Exception:
+            pass  # не критично, ai-core подхватит fallback polling
+
+        # ═══════════════════════════════════════════════════════
+        # Очистка ресурсов (гарантированно выполняется)
+        # ═══════════════════════════════════════════════════════
+        _cleanup_resources(actual_task_id, sandbox_dir)
+
+
+def _publish_result_notification(task_id: str) -> None:
+    """Опубликовать в Redis Pub/Sub, что задача завершена.
+
+    ai-core подписан на канал "coding_tasks:results" и получит
+    уведомление без polling.
+    """
+    try:
+        from redis import Redis
+        r = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        r.publish("coding_tasks:results", task_id)
+        r.close()
+    except Exception:
+        pass  # fallback polling в ai-core подхватит
+
+
+def _cleanup_resources(task_id: str, sandbox_dir: str) -> None:
+    """Очистить Docker-контейнеры и sandbox-директорию.
+
+    Вызывается из finally блока execute_coding_task_sync.
+    Безопасно даже если некоторые ресурсы уже удалены.
+    """
+    try:
+        from docker_manager import cleanup_containers
+
+        # Останавливаем и удаляем Docker-контейнеры задачи
+        cleanup_containers(task_id)
+    except Exception as exc:
+        print(f"worker: ошибка очистки Docker для {task_id}: {exc}", file=sys.stderr)
+
+    # Удаляем sandbox-директорию
+    if sandbox_dir and os.path.exists(sandbox_dir):
+        try:
+            import shutil
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
+        except Exception as exc:
+            print(f"worker: ошибка удаления sandbox {task_id}: {exc}", file=sys.stderr)
+
+    # Отмечаем очистку в job.meta
+    try:
+        _update_job_meta(cleanup_completed=True)
+    except Exception:
+        pass
 
 
 # ── async-обёртка для ai-core (чтобы не блокировать event loop) ──

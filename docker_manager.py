@@ -6,6 +6,29 @@ import subprocess
 import uuid
 
 
+def cleanup_containers(task_id: str) -> None:
+    """Остановить и удалить Docker-контейнеры, связанные с задачей.
+
+    Именованные контейнеры: sandbox-{task_id}, project-test-{task_id}.
+    Безопасно вызывать даже если контейнеры не существуют.
+    """
+    for suffix in (f"sandbox-{task_id}", f"project-test-{task_id}"):
+        try:
+            subprocess.run(
+                ["docker", "stop", suffix],
+                capture_output=True, timeout=10, check=False,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["docker", "rm", "--force", suffix],
+                capture_output=True, timeout=10, check=False,
+            )
+        except Exception:
+            pass
+
+
 class NodeSandbox:
     """Изолированная среда для выполнения Node.js кода в Docker-контейнере.
 
@@ -38,27 +61,41 @@ class NodeSandbox:
                 json.dump(pkg, f, indent=2)
 
     def _run_in_container(self, command: list[str], timeout: int = 30) -> dict:
-        """Синхронный запуск команды в Docker-контейнере (docker-py)."""
+        """Синхронный запуск команды в Docker-контейнере (docker-py).
+
+        Контейнер именуется sandbox-{task_id}, не удаляется автоматически
+        (remove=False) — управление жизнью через cleanup_containers().
+        """
         import docker
         self._ensure_package_json()
 
         client = docker.from_env()
+        container_name = f"sandbox-{self.task_id}"
 
-        # npm install
+        # npm install — удаляем предыдущий контейнер перед запуском
+        try:
+            client.containers.get(container_name).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+
         try:
             client.containers.run(
                 "node:alpine",
                 command=["npm", "install"],
+                name=container_name,
                 volumes={self.sandbox_dir: {"bind": "/app", "mode": "rw"}},
                 working_dir="/app",
                 remove=True,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )
         except docker.errors.ContainerError:
             pass
+        except Exception:
+            pass
 
-        # Основная команда
+        # Основная команда — используем remove=True для авто-очистки
         try:
             logs = client.containers.run(
                 "node:alpine",
@@ -66,6 +103,7 @@ class NodeSandbox:
                 volumes={self.sandbox_dir: {"bind": "/app", "mode": "rw"}},
                 working_dir="/app",
                 remove=True,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )
@@ -179,15 +217,6 @@ class ProjectSandbox:
     соответствующие тесты (pytest / npm test).
     """
 
-    def __init__(self, task_id: str | None = None):
-        """Опциональный конструктор для обратной совместимости.
-
-        Если код вызывает ProjectSandbox(task_id=...), конструктор
-        сохраняет task_id, но не требует обязательных аргументов.
-        """
-        self.task_id = task_id or "default"
-        self.sandbox_dir: str | None = None
-
     @staticmethod
     def detect_project_type(sandbox_dir: str) -> str:
         """Определить тип проекта по наличию конфигурационных файлов."""
@@ -202,12 +231,13 @@ class ProjectSandbox:
         return "unknown"
 
     @staticmethod
-    def run_project_tests(sandbox_dir: str, project_type: str | None = None) -> dict:
+    def run_project_tests(sandbox_dir: str, project_type: str | None = None, task_id: str = "") -> dict:
         """Установить зависимости и запустить тесты проекта в Docker.
 
         Args:
             sandbox_dir: Абсолютный путь к директории проекта.
             project_type: "python", "node" или None (автоопределение).
+            task_id: ID задачи для именования контейнера.
 
         Returns:
             dict {"status": "success"|"error", "output": str}
@@ -216,63 +246,80 @@ class ProjectSandbox:
             project_type = ProjectSandbox.detect_project_type(sandbox_dir)
 
         if project_type == "python":
-            return ProjectSandbox._run_python_tests(sandbox_dir)
+            return ProjectSandbox._run_python_tests(sandbox_dir, task_id)
         elif project_type == "node":
-            return ProjectSandbox._run_node_tests(sandbox_dir)
+            return ProjectSandbox._run_node_tests(sandbox_dir, task_id)
         else:
             return {"status": "error", "output": "Не удалось определить тип проекта"}
 
     # ── Python ────────────────────────────────────────────────────
 
     @staticmethod
-    def _run_python_tests(sandbox_dir: str) -> dict:
+    def _run_python_tests(sandbox_dir: str, task_id: str = "") -> dict:
         """Установить pip-пакеты и запустить pytest в Docker (python:3.12)."""
         import docker
         client = docker.from_env()
+        container_name = f"project-test-{task_id}" if task_id else "project-test"
+
+        def _rm_container():
+            """Удалить существующий контейнер, если есть (force)."""
+            try:
+                c = client.containers.get(container_name)
+                c.remove(force=True)
+            except docker.errors.NotFound:
+                pass
 
         volumes = {sandbox_dir: {"bind": "/app", "mode": "rw"}}
 
         # Устанавливаем зависимости
+        _rm_container()
         try:
             client.containers.run(
                 "python:3.12-slim",
                 command=["sh", "-c", "pip install --quiet -r requirements.txt 2>/dev/null; true"],
+                name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                remove=True,
-                stderr=True,
-                stdout=True,
-            )
-        except Exception:
-            pass  # Если нет requirements — не страшно
-
-        # Устанавливаем pytest
-        try:
-            client.containers.run(
-                "python:3.12-slim",
-                command=["pip", "install", "--quiet", "pytest"],
-                volumes=volumes,
-                working_dir="/app",
-                remove=True,
+                remove=False,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )
         except Exception:
             pass
 
-        # Запускаем pytest (c Docker SDK >=7 timeout перенесён в decode)
+        # Устанавливаем pytest
+        _rm_container()
+        try:
+            client.containers.run(
+                "python:3.12-slim",
+                command=["pip", "install", "--quiet", "pytest"],
+                name=container_name,
+                volumes=volumes,
+                working_dir="/app",
+                remove=False,
+                detach=False,
+                stderr=True,
+                stdout=True,
+            )
+        except Exception:
+            pass
+
+        # Запускаем pytest
+        _rm_container()
         try:
             logs = client.containers.run(
                 "python:3.12-slim",
                 command=["sh", "-c", "python -m pytest -x --timeout=30 --tb=short 2>&1 || true"],
+                name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                remove=True,
+                remove=False,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )
             output = logs.decode("utf-8")
-            # Считаем успехом, если нет ошибок или тесты не найдены
             if "FAILED" in output and "passed" not in output:
                 return {"status": "error", "output": output[-2000:]}
             return {"status": "success", "output": output[-1000:]}
@@ -282,21 +329,32 @@ class ProjectSandbox:
     # ── Node.js ───────────────────────────────────────────────────
 
     @staticmethod
-    def _run_node_tests(sandbox_dir: str) -> dict:
+    def _run_node_tests(sandbox_dir: str, task_id: str = "") -> dict:
         """Установить npm-пакеты и запустить npm test в Docker (node:alpine)."""
         import docker
         client = docker.from_env()
+        container_name = f"project-test-{task_id}" if task_id else "project-test"
+
+        def _rm_container():
+            try:
+                c = client.containers.get(container_name)
+                c.remove(force=True)
+            except docker.errors.NotFound:
+                pass
 
         volumes = {sandbox_dir: {"bind": "/app", "mode": "rw"}}
 
         # npm install
+        _rm_container()
         try:
             client.containers.run(
                 "node:alpine",
                 command=["npm", "install"],
+                name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                remove=True,
+                remove=False,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )
@@ -306,13 +364,16 @@ class ProjectSandbox:
             return {"status": "error", "output": f"npm install error: {e}"}
 
         # npm test
+        _rm_container()
         try:
             logs = client.containers.run(
                 "node:alpine",
                 command=["sh", "-c", "npm test 2>&1; true"],
+                name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                remove=True,
+                remove=False,
+                detach=False,
                 stderr=True,
                 stdout=True,
             )

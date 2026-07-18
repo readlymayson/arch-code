@@ -4,6 +4,7 @@ Phase B: агент работает внутри sandbox с полным про
 Умеет читать/писать файлы через FileManagementTools.
 """
 
+import json as _json
 import os
 from typing import TypedDict
 
@@ -28,7 +29,7 @@ def _get_llm() -> ChatOpenAI:
         _flash_llm = ChatOpenAI(
             model="deepseek/deepseek-v4-flash",
             api_key=os.getenv("ROUTERAI_API_KEY"),
-            base_url="https://api.routerai.com/v1",
+            base_url=os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1"),
         )
     return _flash_llm
 
@@ -124,7 +125,6 @@ def execute_actions(state: AgentState):
     raw = _sanitize(response.content)
 
     # Парсим JSON-ответ
-    import json as _json
     try:
         # Извлекаем JSON из ответа
         if "```json" in raw:
@@ -201,16 +201,26 @@ def execute_actions(state: AgentState):
 
 
 # ── Узел: тестирование в Docker ─────────────────────────────────
-def test_code(state: AgentState):
+def run_tests(state: AgentState):
     """Запустить тесты проекта в Docker-контейнере."""
     sandbox_dir = state["sandbox_dir"]
 
-    # Определяем тип проекта через штатный метод ProjectSandbox
-    sandbox_type = ProjectSandbox.detect_project_type(sandbox_dir)
+    # Определяем тип проекта
+    has_requirements = os.path.exists(os.path.join(sandbox_dir, "requirements.txt"))
+    has_package_json = os.path.exists(os.path.join(sandbox_dir, "package.json"))
+    has_pyproject = os.path.exists(os.path.join(sandbox_dir, "pyproject.toml"))
+    has_setup_py = os.path.exists(os.path.join(sandbox_dir, "setup.py"))
+
+    if has_requirements or has_pyproject or has_setup_py:
+        sandbox_type = "python"
+    elif has_package_json:
+        sandbox_type = "node"
+    else:
+        sandbox_type = "unknown"
 
     # Устанавливаем зависимости и запускаем тесты
     try:
-        result = ProjectSandbox.run_project_tests(sandbox_dir, sandbox_type)
+        result = ProjectSandbox.run_project_tests(sandbox_dir, sandbox_type, task_id=state["task_id"])
     except Exception as e:
         return {
             "success": False,
@@ -242,7 +252,7 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("explore", explore_project)
 workflow.add_node("execute", execute_actions)
-workflow.add_node("test", test_code)
+workflow.add_node("test", run_tests)
 
 workflow.set_entry_point("explore")
 workflow.add_edge("explore", "execute")

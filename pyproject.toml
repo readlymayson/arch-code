@@ -1,0 +1,21 @@
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "sandbox/*",
+    ".github/*",
+    "htmlcov/*",
+    ".pytest_cache/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "except Exception:",
+    "except ImportError:",
+]
+fail_under = 50
