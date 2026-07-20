@@ -115,7 +115,7 @@ class TestExploreProject:
 # ── execute_actions ─────────────────────────────────────────────
 
 class TestExecuteActions:
-    """Узел выполнения действий (чтение/запись файлов)."""
+    """Узел выполнения действий (чтение/запись файлов) через bind_tools."""
 
     @pytest.fixture
     def base_state(self, temp_sandbox):
@@ -134,97 +134,153 @@ class TestExecuteActions:
             "changed_files": [],
         }
 
-    def test_json_array_tool_calls(self, mocker, base_state):
-        """LLM возвращает JSON-массив tool calls — успешное выполнение."""
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = json.dumps([
-            {"tool": "done", "changed_files": ["app.js"]},
-        ])
+    def _mock_tool_call_response(self, name: str, args: dict, tool_call_id: str = "call_001"):
+        """Создать AIMessage с tool_calls (как возвращает bind_tools)."""
+        from langchain_core.messages import AIMessage
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": name,
+                "args": args,
+                "id": tool_call_id,
+                "type": "tool_call",
+            }],
+        )
 
-        result = execute_actions(base_state)
-        assert result["success"] is True
-        assert "app.js" in result["changed_files"]
-
-    def test_markdown_wrapped_json(self, mocker, base_state):
-        """LLM оборачивает JSON в ``` — парсинг работает."""
+    def test_done_with_files(self, mocker, base_state):
+        """Агент вызывает done() с changed_files — задача завершена."""
         mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = (
-            "```json\n[{\"tool\": \"done\", \"changed_files\": [\"app.js\"]}]\n```"
+        # Мокаем bind_tools — возвращаем тот же llm
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        # Первый вызов — сразу done
+        mock_llm.return_value.invoke.return_value = self._mock_tool_call_response(
+            "done", {"changed_files": ["app.js", "core/new.py"]}
         )
 
         result = execute_actions(base_state)
         assert result["success"] is True
+        assert "app.js" in result["changed_files"]
+        assert "core/new.py" in result["changed_files"]
 
-    def test_non_json_fallback(self, mocker, base_state):
-        """Не-JSON ответ — fallback на done."""
+    def test_read_then_write_then_done(self, mocker, base_state):
+        """Цикл: read → write → done."""
         mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = "Я закончил работу!"
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
 
-        result = execute_actions(base_state)
-        assert result["success"] is True
-        assert result["changed_files"] == []
-
-    def test_write_file_creates_file(self, mocker, base_state):
-        """write_file создаёт файл и добавляет в changed_files."""
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = json.dumps([
-            {"tool": "write_file", "relative_path": "new_file.js", "content": "// new"},
-        ])
-        # Второй вызов (feedback) — DONE
+        # Имитация: сначала read_file, потом write_file, потом done
         mock_llm.return_value.invoke.side_effect = [
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "write_file", "relative_path": "new_file.js", "content": "// new"},
-            ])),
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "done", "changed_files": ["new_file.js"]},
-            ])),
+            self._mock_tool_call_response(
+                "read_file_tool", {"relative_path": "app.js"}, "call_001"
+            ),
+            self._mock_tool_call_response(
+                "write_file_tool", {"relative_path": "new.py", "content": "x=1"}, "call_002"
+            ),
+            self._mock_tool_call_response(
+                "done", {"changed_files": ["new.py"]}, "call_003"
+            ),
         ]
 
         result = execute_actions(base_state)
         assert result["success"] is True
+        assert "new.py" in result["changed_files"]
 
-        # Файл должен существовать
-        new_file = os.path.join(base_state["sandbox_dir"], "new_file.js")
+    def test_write_file_physically_created(self, mocker, base_state):
+        """write_file_tool создаёт реальный файл в sandbox."""
+        mock_llm = mocker.patch("graph_worker._get_llm")
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        mock_llm.return_value.invoke.side_effect = [
+            self._mock_tool_call_response(
+                "write_file_tool", {
+                    "relative_path": "generated.py",
+                    "content": "print('hello')",
+                }, "call_001"
+            ),
+            self._mock_tool_call_response(
+                "done", {"changed_files": ["generated.py"]}, "call_002"
+            ),
+        ]
+
+        execute_actions(base_state)
+
+        new_file = os.path.join(base_state["sandbox_dir"], "generated.py")
         assert os.path.exists(new_file)
+        assert open(new_file).read() == "print('hello')"
+
+    def test_list_files_tool(self, mocker, base_state):
+        """list_files возвращает дерево."""
+        mock_llm = mocker.patch("graph_worker._get_llm")
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        mock_llm.return_value.invoke.side_effect = [
+            self._mock_tool_call_response(
+                "list_files_tool", {"relative_path": ""}, "call_001"
+            ),
+            self._mock_tool_call_response(
+                "done", {"changed_files": []}, "call_002"
+            ),
+        ]
+
+        result = execute_actions(base_state)
+        assert result["success"] is True
 
     def test_read_nonexistent_file(self, mocker, base_state):
-        """read_file несуществующего файла — ошибка в результате."""
+        """read_file несуществующего файла не крашит."""
         mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = json.dumps([
-            {"tool": "read_file", "relative_path": "nonexistent.py"},
-        ])
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
         mock_llm.return_value.invoke.side_effect = [
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "read_file", "relative_path": "nonexistent.py"},
-            ])),
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "done", "changed_files": []},
-            ])),
-        ]
-
-        result = execute_actions(base_state)
-        assert result["success"] is True  # Ошибка чтения не прерывает цикл
-
-    def test_multiple_tool_calls(self, mocker, base_state):
-        """Несколько tool calls в одном ответе."""
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = json.dumps([
-            {"tool": "read_file", "relative_path": "app.js"},
-            {"tool": "list_files", "relative_path": ""},
-        ])
-        mock_llm.return_value.invoke.side_effect = [
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "read_file", "relative_path": "app.js"},
-                {"tool": "list_files", "relative_path": ""},
-            ])),
-            mocker.MagicMock(content=json.dumps([
-                {"tool": "done", "changed_files": []},
-            ])),
+            self._mock_tool_call_response(
+                "read_file_tool", {"relative_path": "nonexistent.py"}, "call_001"
+            ),
+            self._mock_tool_call_response(
+                "done", {"changed_files": []}, "call_002"
+            ),
         ]
 
         result = execute_actions(base_state)
         assert result["success"] is True
 
+    def test_unknown_tool_graceful(self, mocker, base_state):
+        """Неизвестный инструмент не крашит."""
+        mock_llm = mocker.patch("graph_worker._get_llm")
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        mock_llm.return_value.invoke.side_effect = [
+            self._mock_tool_call_response(
+                "unknown_tool", {"x": "y"}, "call_001"
+            ),
+            self._mock_tool_call_response(
+                "done", {"changed_files": []}, "call_002"
+            ),
+        ]
+
+        result = execute_actions(base_state)
+        assert result["success"] is True
+
+    def test_no_tool_calls_text_response(self, mocker, base_state):
+        """LLM вернула текст без tool_calls — не падает."""
+        from langchain_core.messages import AIMessage
+
+        mock_llm = mocker.patch("graph_worker._get_llm")
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        # Первый ответ — текст, второй — done
+        mock_llm.return_value.invoke.side_effect = [
+            AIMessage(content="Я читаю файлы..."),
+            self._mock_tool_call_response(
+                "done", {"changed_files": []}, "call_002"
+            ),
+        ]
+
+        result = execute_actions(base_state)
+        assert result["success"] is True
+
+    def test_iterations_incremented(self, mocker, base_state):
+        """iterations увеличивается на 1."""
+        mock_llm = mocker.patch("graph_worker._get_llm")
+        mock_llm.return_value.bind_tools.return_value = mock_llm.return_value
+        mock_llm.return_value.invoke.return_value = self._mock_tool_call_response(
+            "done", {"changed_files": []}
+        )
+
+        result = execute_actions(base_state)
+        assert result["iterations"] == 2  # было 1, стало 2
 
 # ── test_code ───────────────────────────────────────────────────
 

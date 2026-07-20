@@ -46,6 +46,7 @@ from tools.file_tools import (
     list_files,
     read_file,
     write_file,
+    make_coding_tools,
 )
 
 
@@ -270,3 +271,86 @@ class TestWriteFile:
         task_dir = str(temp_sandbox / "test_task_001")
         result = write_file(task_dir, "../../malicious.js", "evil code")
         assert "❌" in result or "вне песочницы" in result
+
+
+# ── make_coding_tools ──────────────────────────────────────────
+
+class TestMakeCodingTools:
+    """LangChain Tool definitions для graph_worker."""
+
+    def test_returns_list_of_tools(self, temp_sandbox):
+        """Возвращает список инструментов."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        assert isinstance(tools, list)
+        assert len(tools) == 4
+
+    def test_tool_names(self, temp_sandbox):
+        """Имена инструментов корректны."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        names = [t.name for t in tools]
+        assert "read_file_tool" in names
+        assert "write_file_tool" in names
+        assert "list_files_tool" in names
+        assert "done" in names
+
+    def test_read_file_tool_works(self, temp_sandbox):
+        """read_file_tool читает файл внутри sandbox."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        read_tool = [t for t in tools if t.name == "read_file_tool"][0]
+
+        result = read_tool.invoke({"relative_path": "app.js"})
+        assert "express" in result
+
+    def test_write_file_tool_creates_file(self, temp_sandbox):
+        """write_file_tool создаёт файл."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        write_tool = [t for t in tools if t.name == "write_file_tool"][0]
+
+        result = write_tool.invoke({
+            "relative_path": "generated.py",
+            "content": "# test\nprint('hello')\n",
+        })
+        assert "✅" in result or "Файл записан" in result
+
+        created_file = os.path.join(task_dir, "generated.py")
+        assert os.path.exists(created_file)
+        assert open(created_file).read() == "# test\nprint('hello')\n"
+
+    def test_write_tool_creates_directories(self, temp_sandbox):
+        """write_file_tool создаёт поддиректории."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        write_tool = [t for t in tools if t.name == "write_file_tool"][0]
+
+        write_tool.invoke({
+            "relative_path": "core/billing_manager.py",
+            "content": "class BillingManager: pass\n",
+        })
+        assert os.path.exists(os.path.join(task_dir, "core", "billing_manager.py"))
+
+    def test_list_files_tool_shows_tree(self, temp_sandbox):
+        """list_files_tool показывает дерево."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        list_tool = [t for t in tools if t.name == "list_files_tool"][0]
+
+        result = list_tool.invoke({"relative_path": ""})
+        assert "app.js" in result
+        assert "subdir/" in result
+
+    def test_done_returns_marker(self, temp_sandbox):
+        """done возвращает маркер DONE с JSON."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        tools = make_coding_tools(task_dir)
+        done_tool = [t for t in tools if t.name == "done"][0]
+
+        result = done_tool.invoke({"changed_files": ["app.js", "core/new.py"]})
+        assert result.startswith("DONE:")
+        import json
+        files = json.loads(result.split("DONE:")[1])
+        assert "app.js" in files
+        assert "core/new.py" in files

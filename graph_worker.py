@@ -1,7 +1,7 @@
 """LangGraph-цикл: explore → generate → test → (исправление) → конец.
 
 Phase B: агент работает внутри sandbox с полным проектом.
-Умеет читать/писать файлы через FileManagementTools.
+Использует нативный Tool Calling (bind_tools) вместо JSON-эмуляции.
 """
 
 import json as _json
@@ -10,10 +10,11 @@ from typing import TypedDict
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 
 from docker_manager import ProjectSandbox
-from tools.file_tools import list_files, read_file, write_file
+from tools.file_tools import list_files, make_coding_tools
 
 load_dotenv()
 
@@ -42,6 +43,7 @@ def _sanitize(text: str) -> str:
 
 
 # ── Состояние графа ──────────────────────────────────────────────
+
 class AgentState(TypedDict):
     task_id: str          # уникальный ID задачи (для изоляции sandbox)
     sandbox_dir: str      # абсолютный путь к sandbox/{task_id}/
@@ -57,6 +59,7 @@ class AgentState(TypedDict):
 
 
 # ── Узел: исследование проекта ──────────────────────────────────
+
 def explore_project(state: AgentState):
     """Первый запуск: показать агенту структуру проекта."""
     sandbox_dir = state["sandbox_dir"]
@@ -77,7 +80,7 @@ def explore_project(state: AgentState):
         "1. Сначала изучи структуру — она показана выше.\n"
         "2. Прочитай нужные файлы через read_file().\n"
         "3. Внеси изменения через write_file().\n"
-        "4. Когда закончишь, напиши 'DONE' и перечисли изменённые файлы.\n"
+        "4. Когда закончишь, вызови done() с путями изменённых файлов.\n"
         "5. НЕ выдумывай информацию — читай реальные файлы проекта.\n"
         "6. НЕ трогай .env, конфиги с секретами.\n\n"
         "Какие файлы тебе нужно прочитать для начала работы?"
@@ -88,119 +91,124 @@ def explore_project(state: AgentState):
 
 
 # ── Узел: выполнение действий (чтение/запись файлов) ────────────
+
+# Максимальное количество вызовов инструментов в одном узле
+_MAX_TOOL_CALLS = 25
+
+
 def execute_actions(state: AgentState):
-    """Агент читает и пишет файлы. Вызывается повторно, пока не скажет DONE."""
+    """Агент читает и пишет файлы через нативный Tool Calling.
+
+    Использует llm.bind_tools() — модель получает инструменты через API,
+    а не через текстовый JSON-промпт. LangChain сам парсит tool_calls,
+    Pydantic валидирует аргументы.
+    """
     sandbox_dir = state["sandbox_dir"]
     task = state["task"]
     last_error = state["error"]
 
-    # Собираем контекст: читаем ключевые файлы для понимания задачи
-    # Сначала покажем агенту результат предыдущей итерации (если была ошибка)
-    error_context = ""
-    if last_error:
-        error_context = f"\nПредыдущая попытка упала с ошибкой:\n{last_error}\nИсправь код.\n"
+    # Инструменты с привязкой к sandbox_dir (partial)
+    tools = make_coding_tools(sandbox_dir)
+    llm = _get_llm().bind_tools(tools)
 
-    # Даём агенту инструменты через prompt
-    # В LangGraph мы НЕ вызываем инструменты автоматически, а даём LLM
-    # описание инструментов и просим вернуть JSON с вызовами.
-    # Парсим ответ и вызываем соответствующие функции.
-
-    prompt = (
-        f"Ты — AI-разработчик. Задача: {task}\n"
-        f"{error_context}\n"
-        "Ты работаешь в копии проекта. У тебя есть инструменты:\n\n"
-        "1. read_file(relative_path) — прочитать файл (вернёт содержимое)\n"
-        "2. write_file(relative_path, content) — записать/перезаписать файл\n"
-        "3. list_files(relative_path='') — показать содержимое папки\n\n"
-        "ВАЖНО:\n"
-        "- Верни ТОЛЬКО JSON-массив вызовов инструментов.\n"
-        "- Формат: [{\"tool\": \"read_file\", \"relative_path\": \"...\"}, ...]\n"
-        "- Если задача решена, верни: [{\"tool\": \"done\", \"changed_files\": [\"file1.py\", \"file2.py\"]}]\n"
-        "- Если нужно исправить ошибку — сделай write_file с исправленным кодом.\n"
-        "- Не используй markdown, только JSON.\n"
-        "- Относительные пути считаются от корня проекта.\n"
+    error_context = (
+        f"\nПредыдущая попытка упала с ошибкой:\n{last_error}\n"
+        f"Исправь код и вернись в done().\n"
+        if last_error else ""
     )
 
-    response = _get_llm().invoke(prompt)
-    raw = _sanitize(response.content)
+    # ── Формируем system prompt ────────────────────────────────
+    system_prompt = (
+        "Ты — AI-разработчик. Ты работаешь в fullstack-копии Python-проекта.\n\n"
+        "Твои инструменты:\n"
+        "- read_file(relative_path) — прочитать файл\n"
+        "- write_file(relative_path, content) — записать новый или перезаписать существующий файл\n"
+        "- list_files(relative_path) — показать содержимое папки\n"
+        "- done(changed_files) — завершить задачу (передай список созданных/изменённых файлов)\n\n"
+        "Правила:\n"
+        "1. Сначала изучи структуру и прочитай существующие файлы.\n"
+        "2. Каждый новый файл пиши ПОЛНОСТЬЮ — не используй '...' или 'остальное без изменений'.\n"
+        "3. После внесения всех изменений ВСЕГДА вызови done() с путями изменённых файлов.\n"
+        "4. Не трогай .env, базы данных, .git/, venv/, __pycache__.\n"
+        "5. Если нужно создать новые папки — write_file создаст их автоматически."
+    )
 
-    # Парсим JSON-ответ
-    try:
-        # Извлекаем JSON из ответа
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
+    messages = [
+        ("system", system_prompt),
+        ("human", (
+            f"Задача: {task}\n{error_context}"
+            f"Изучи проект, прочитай нужные файлы и реализуй требуемые изменения. "
+            f"По завершении вызови done()."
+        )),
+    ]
 
-        calls = _json.loads(raw)
-        if not isinstance(calls, list):
-            calls = [calls]
-    except Exception:
-        # Если не JSON — считаем, что это текстовый ответ (DONE)
-        calls = [{"tool": "done", "changed_files": []}]
+    changed_files = []
 
-    # Выполняем вызовы
-    results = []
-    changed = []
-    is_done = False
+    for _ in range(_MAX_TOOL_CALLS):
+        response = llm.invoke(messages)
 
-    for call in calls:
-        tool = call.get("tool", "")
-        if tool == "done":
-            is_done = True
-            changed = call.get("changed_files", [])
-            break
-        elif tool == "read_file":
-            path = call.get("relative_path", "")
-            result = read_file(sandbox_dir, path)
-            results.append(f"--- read_file({path}) ---\n{result}")
-        elif tool == "write_file":
-            path = call.get("relative_path", "")
-            content = call.get("content", "")
-            result = write_file(sandbox_dir, path, content)
-            results.append(result)
-            if "✅" in result:
-                changed.append(path)
-        elif tool == "list_files":
-            path = call.get("relative_path", "")
-            result = list_files(sandbox_dir, path)
-            results.append(f"--- list_files({path}) ---\n{result}")
+        # ── Проверяем наличие tool_calls ──────────────────────
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            # Добавляем AIMessage в историю (с tool_calls)
+            messages.append(response)
 
-    # Если агент не сказал DONE, даём ему результаты и просим продолжить
-    if not is_done:
-        log = "\n\n".join(results)
-        feedback_prompt = (
-            f"Результаты выполнения:\n{log}\n\n"
-            "Продолжай. Если всё готово — верни [{\"tool\": \"done\", \"changed_files\": [...]}]"
-        )
-        feedback = _get_llm().invoke(feedback_prompt)
-        try:
-            raw2 = feedback.content
-            if "```json" in raw2:
-                raw2 = raw2.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw2:
-                raw2 = raw2.split("```")[1].split("```")[0].strip()
-            done_call = _json.loads(raw2)
-            if isinstance(done_call, list):
-                for c in done_call:
-                    if c.get("tool") == "done":
-                        is_done = True
-                        changed = c.get("changed_files", [])
+            for tc in response.tool_calls:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", {})
+
+                # Инструмент done — завершение
+                if tool_name == "done":
+                    changed_files = tool_args.get("changed_files", [])
+                    return {
+                        "success": True,
+                        "changed_files": changed_files,
+                        "iterations": state["iterations"] + 1,
+                    }
+
+                # Выполняем инструмент
+                result_text = ""
+                for t in tools:
+                    if t.name == tool_name:
+                        try:
+                            result_text = t.invoke(tool_args)
+                        except Exception as e:
+                            result_text = f"❌ Ошибка вызова {tool_name}: {e}"
                         break
-            elif done_call.get("tool") == "done":
-                is_done = True
-                changed = done_call.get("changed_files", [])
-        except Exception:
-            pass
+
+                if not result_text:
+                    result_text = f"❌ Инструмент '{tool_name}' не найден"
+
+                messages.append(
+                    ToolMessage(content=result_text, tool_call_id=tc["id"])
+                )
+
+            # После выполнения tool_calls — идём на следующий виток
+            continue
+
+        # ── Нет tool_calls — возможно DONE в тексте ──────────
+        content = response.content or ""
+        messages.append(AIMessage(content=content))
+
+        if "DONE" in content.upper() or "done" in content.lower():
+            break
+
+        # Последний шанс: просим явно вызвать done()
+        messages.append(
+            HumanMessage(
+                content="Ты не вызвал done(). Если задача выполнена — вызови done() "
+                        "с путями изменённых файлов. Если нет — продолжай работу."
+            )
+        )
 
     return {
         "success": True,
-        "changed_files": changed,
+        "changed_files": changed_files,
         "iterations": state["iterations"] + 1,
     }
 
 
 # ── Узел: тестирование в Docker ─────────────────────────────────
+
 def run_tests(state: AgentState):
     """Запустить тесты проекта в Docker-контейнере."""
     sandbox_dir = state["sandbox_dir"]
@@ -224,7 +232,7 @@ def run_tests(state: AgentState):
     except Exception as e:
         return {
             "success": False,
-            "error": _sanitize(f"Ошибка Docker: {e}"),
+            "error": f"Ошибка Docker: {e}",
             "test_passed": False,
         }
 
@@ -233,12 +241,13 @@ def run_tests(state: AgentState):
     else:
         return {
             "success": False,
-            "error": _sanitize(result["output"]),
+            "error": result["output"],
             "test_passed": False,
         }
 
 
 # ── Маршрутизация ────────────────────────────────────────────────
+
 def route_next_step(state: AgentState):
     if state["success"]:
         return END
@@ -248,6 +257,7 @@ def route_next_step(state: AgentState):
 
 
 # ── Сборка графа ─────────────────────────────────────────────────
+
 workflow = StateGraph(AgentState)
 
 workflow.add_node("explore", explore_project)

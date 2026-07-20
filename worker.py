@@ -111,41 +111,29 @@ def sync_project_to_sandbox(task_id: str, source_dir: str | None = None) -> str:
 def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
     """Вычислить изменения в песочнице относительно git.
 
-    Инициализирует временный git-репозиторий, делает add всех файлов,
-    и возвращает список изменённых файлов с diff.
+    Предполагает, что git уже инициализирован и есть коммит (initial state).
+    Сравнивает HEAD с текущим состоянием рабочей директории.
+
+    ВАЖНО: В результат добавляется поле 'content' — содержимое новых/изменённых
+    файлов из sandbox. Это позволяет ai-core создавать патч даже после удаления
+    sandbox (cleanup вызывается в finally).
 
     Returns:
-        Список словарей: [{"path": "adapters/vk.py", "diff": "...", "status": "modified"}, ...]
+        Список словарей:
+        [{"path": "core/billing_manager.py", "diff": "@@...", "status": "added",
+          "content": "полное содержимое файла"}, ...]
     """
-    timeout = 30  # единый таймаут на git-операции
+    timeout = 30
 
     try:
-        # Инициализируем git, если ещё нет
-        subprocess.run(
-            ["git", "init", "--initial-branch=main"],
-            cwd=sandbox_dir, check=True, capture_output=True,
-            timeout=timeout,
-        )
-        # Настраиваем user для коммита (чтобы git не ругался)
-        subprocess.run(
-            ["git", "config", "user.email", "arch-code@ai.local"],
-            cwd=sandbox_dir, check=True, capture_output=True,
-            timeout=timeout,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Arch Code Agent"],
-            cwd=sandbox_dir, check=True, capture_output=True,
-            timeout=timeout,
-        )
-
-        # add всех файлов
+        # Добавляем и проверяем unfitted-файлы
         subprocess.run(
             ["git", "add", "-A"],
             cwd=sandbox_dir, check=True, capture_output=True,
             timeout=timeout,
         )
 
-        # Статус (нужен для списка изменённых файлов)
+        # Статус в staging (индекс) — после git add -A
         status_result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=sandbox_dir, check=True, capture_output=True, text=True,
@@ -157,43 +145,58 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
             if not line.strip():
                 continue
             # Формат: "XY filename"
-            xy = line[:2].strip()
+            # X — статус в staging (индекс), Y — статус в working tree
+            # После git add -A: X=A/M/D, Y=пусто
+            x_status = line[0:1]  # первый символ — статус в staging
             filename = line[3:].strip()
 
-            if xy == "??":
+            if x_status == "A":
                 status = "added"
-            elif xy in ("M", " M", "M "):
+            elif x_status == "M":
                 status = "modified"
-            elif xy in ("D", " D", "D "):
+            elif x_status == "D":
                 status = "deleted"
+            elif line[:2].strip() == "??":
+                status = "added"
             else:
-                status = "changed"
+                status = "modified"
 
-            # diff для этого файла
+            # diff относительно HEAD, ИЗ ИНДЕКСА (staged)
+            # После git add -A все изменения в staging, а working tree пуст.
+            # Без --cached diff будет пустым!
             diff_result = subprocess.run(
-                ["git", "diff", "--no-color", "--", filename],
+                ["git", "diff", "--cached", "HEAD", "--no-color", "--", filename],
                 cwd=sandbox_dir, capture_output=True, text=True,
                 timeout=timeout,
             )
-            # Если файл новый — показываем его содержимое
-            if not diff_result.stdout and status == "added":
+
+            # Читаем содержимое файла из sandbox (для create_transactional_patch)
+            file_path = os.path.join(sandbox_dir, filename)
+            content = None
+            if status != "deleted" and os.path.isfile(file_path):
                 try:
-                    with open(os.path.join(sandbox_dir, filename)) as f:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                    diff_result.stdout = f"(new file)\n{content[:2000]}"
                 except Exception:
                     pass
 
-            changed.append({
+            diff_text = diff_result.stdout[:5000] if diff_result.stdout else ""
+            if not diff_text and status == "added" and content is not None:
+                diff_text = f"(new file)\n{content[:2000]}"
+
+            entry = {
                 "path": filename,
                 "status": status,
-                "diff": diff_result.stdout[:5000] if diff_result.stdout else "(нет diff, возможно бинарный)",
-            })
+                "diff": diff_text or "(нет diff)",
+            }
+            if content is not None:
+                entry["content"] = content
+
+            changed.append(entry)
 
         return changed
 
     except FileNotFoundError:
-        # git не установлен — возвращаем пустой список
         return []
     except Exception as e:
         return [{"path": "_error_", "status": "error", "diff": str(e)}]
@@ -267,6 +270,39 @@ def execute_coding_task_sync(
             "error",
             actual_task_id,
             error=f"Не удалось скопировать проект в sandbox: {exc}",
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # 1c. Инициализация git в песочнице (до работы агента)
+    #     Нужно для compute_sandbox_diff() — чтобы diff считался
+    #     относительно исходного состояния, а не всех 133 файлов.
+    # ═══════════════════════════════════════════════════════════
+    try:
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "arch-code@ai.local"],
+            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Arch Code Agent"],
+            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial state before agent"],
+            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+    except Exception as exc:
+        return _make_result(
+            "error",
+            actual_task_id,
+            error=f"Не удалось инициализировать git в sandbox: {exc}",
         )
 
     # ── try/finally гарантирует очистку ресурсов ──────────────

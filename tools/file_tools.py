@@ -182,3 +182,60 @@ def write_file(sandbox_dir: str, filepath: str, content: str) -> str:
         return f"✅ Файл записан: {rel} ({len(content)} символов)"
     except Exception as e:
         return f"❌ Ошибка записи: {e}"
+
+
+# ── LangChain Tool Definitions (для graph_worker.py) ────────────
+
+from functools import partial
+from langchain_core.tools import tool as _lc_tool
+
+
+def make_coding_tools(sandbox_dir: str) -> list:
+    """Создать набор инструментов для агента с привязкой к sandbox_dir.
+
+    Args:
+        sandbox_dir: Абсолютный путь к песочнице.
+
+    Returns:
+        Список LangChain BaseTool для bind_tools().
+    """
+
+    @_lc_tool
+    def read_file_tool(relative_path: str) -> str:
+        """Прочитать содержимое файла внутри проекта.
+
+        Args:
+            relative_path: Путь к файлу относительно корня проекта (например 'core/billing_manager.py').
+        """
+        return read_file(sandbox_dir, relative_path)
+
+    @_lc_tool
+    def write_file_tool(relative_path: str, content: str) -> str:
+        """Записать новый файл или перезаписать существующий.
+
+        Args:
+            relative_path: Путь к файлу относительно корня проекта.
+            content: Полное содержимое файла.
+        """
+        return write_file(sandbox_dir, relative_path, content)
+
+    @_lc_tool
+    def list_files_tool(relative_path: str = "") -> str:
+        """Показать дерево файлов и папок внутри проекта.
+
+        Args:
+            relative_path: Путь к папке (пустая строка = корень проекта).
+        """
+        return list_files(sandbox_dir, relative_path)
+
+    @_lc_tool(return_direct=True)
+    def done(changed_files: list[str]) -> str:
+        """Вызвать, когда все изменения внесены и задача выполнена.
+
+        Args:
+            changed_files: Список относительных путей к созданным/изменённым файлам.
+        """
+        import json
+        return f"DONE:{json.dumps(changed_files)}"
+
+    return [read_file_tool, write_file_tool, list_files_tool, done]
