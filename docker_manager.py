@@ -1,9 +1,12 @@
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 def cleanup_containers(task_id: str) -> None:
@@ -256,7 +259,12 @@ class ProjectSandbox:
 
     @staticmethod
     def _run_python_tests(sandbox_dir: str, task_id: str = "") -> dict:
-        """Установить pip-пакеты и запустить pytest в Docker (python:3.12)."""
+        """Установить pytest и запустить тесты в Docker (python:3.12-slim).
+
+        Внимание: не пытается форсированно установить ВСЕ зависимости проекта
+        (torch, tiktoken, cryptg требуют компиляции в slim-образе).
+        Устанавливает только pytest — тесты на чистом Python/stdlib пройдут.
+        """
         import docker
         client = docker.from_env()
         container_name = f"project-test-{task_id}" if task_id else "project-test"
@@ -271,12 +279,17 @@ class ProjectSandbox:
 
         volumes = {sandbox_dir: {"bind": "/app", "mode": "rw"}}
 
-        # Устанавливаем зависимости
+        # ── Шаг 1: Пытаемся установить зависимости проекта ─────
+        # Не фатально — torch/tiktoken/cryptg не ставятся в slim
         _rm_container()
         try:
             client.containers.run(
                 "python:3.12-slim",
-                command=["sh", "-c", "pip install --quiet -r requirements.txt 2>/dev/null; true"],
+                command=[
+                    "sh", "-c",
+                    "pip install --quiet --timeout=60 -r requirements.txt 2>&1 || "
+                    "echo '[arch-code] ⚠️ Некоторые зависимости не установлены, продолжаем...'"
+                ],
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
@@ -284,16 +297,17 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
+                timeout=120,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Docker: pip install requirements.txt не удался: {exc}")
 
-        # Устанавливаем pytest
+        # ── Шаг 2: Устанавливаем pytest ────────────────────────
         _rm_container()
         try:
             client.containers.run(
                 "python:3.12-slim",
-                command=["pip", "install", "--quiet", "pytest"],
+                command=["pip", "install", "--quiet", "pytest", "pytest-timeout"],
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
@@ -301,11 +315,12 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
+                timeout=60,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            return {"status": "error", "output": f"Не удалось установить pytest: {exc}"}
 
-        # Запускаем pytest
+        # ── Шаг 3: Запускаем pytest ────────────────────────────
         _rm_container()
         try:
             logs = client.containers.run(
@@ -318,9 +333,11 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
+                timeout=120,
             )
             output = logs.decode("utf-8")
-            if "FAILED" in output and "passed" not in output:
+            # Считаем успехом, если нет FAILED (включая "no tests ran")
+            if "FAILED" in output and ("passed" not in output or "failed" in output):
                 return {"status": "error", "output": output[-2000:]}
             return {"status": "success", "output": output[-1000:]}
         except Exception as e:
