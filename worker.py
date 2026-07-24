@@ -320,6 +320,12 @@ def execute_coding_task_sync(
             "iterations": 0,
             "success": False,
             "changed_files": [],
+            "thought_steps": [],
+            "action_steps": [],
+            "chain_of_thought": "",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "model": "deepseek/deepseek-v4-flash",
         }
 
         # ═══════════════════════════════════════════════════════
@@ -339,7 +345,15 @@ def execute_coding_task_sync(
 
         # Обновляем прогресс после графа
         iterations = final_state.get("iterations", 0)
-        _update_job_meta(current_step="compute_diff", progress=90, iteration=iterations)
+        _update_job_meta(
+            current_step="compute_diff", progress=90, iteration=iterations,
+            thought_steps=final_state.get("thought_steps", []),
+            action_steps=final_state.get("action_steps", []),
+            chain_of_thought=final_state.get("chain_of_thought", ""),
+            prompt_tokens=final_state.get("prompt_tokens", 0),
+            completion_tokens=final_state.get("completion_tokens", 0),
+            model=final_state.get("model", "deepseek/deepseek-v4-flash"),
+        )
 
         # ═══════════════════════════════════════════════════════
         # 3. Вычисление git diff после работы агента

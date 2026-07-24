@@ -6,6 +6,7 @@ Phase B: агент работает внутри sandbox с полным про
 
 import json as _json
 import os
+import time as _time
 from typing import TypedDict
 
 from dotenv import load_dotenv
@@ -56,6 +57,41 @@ class AgentState(TypedDict):
     iterations: int       # счётчик попыток
     success: bool         # финальный успех
     changed_files: list   # список изменённых файлов
+    # ── Подробности для панели мониторинга ───────────────────
+    thought_steps: list   # структурированные мысли агента
+    action_steps: list    # структурированные действия
+    chain_of_thought: str # свободная цепочка рассуждений
+    # ── Billing / метрики ────────────────────────────────────
+    prompt_tokens: int    # всего токенов промпта
+    completion_tokens: int  # всего токенов генерации
+    model: str            # название модели
+
+
+# ── Утилита для таймстампов ──────────────────────────────────────
+
+
+def _now_iso() -> str:
+    """Текущее время в ISO-формате."""
+    return _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime())
+
+
+def _sum_tokens(response) -> dict:
+    """Извлечь количество токенов из LLM-ответа.
+
+    Returns:
+        dict с prompt_tokens, completion_tokens.
+    """
+    try:
+        md = getattr(response, "response_metadata", {}) or {}
+        usage = md.get("token_usage", md.get("usage", {}))
+        if isinstance(usage, dict):
+            return {
+                "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
+                "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
+            }
+    except Exception:
+        pass
+    return {"prompt_tokens": 0, "completion_tokens": 0}
 
 
 # ── Узел: исследование проекта ──────────────────────────────────
@@ -87,7 +123,27 @@ def explore_project(state: AgentState):
     )
 
     response = _get_llm().invoke(prompt)
-    return {"error": "", "iterations": state["iterations"] + 1}
+    thought = getattr(response, "content", str(response))[:500]
+    tokens = _sum_tokens(response)
+
+    ts = _now_iso()
+    thought_steps = state.get("thought_steps", []) + [
+        {"node": "explore", "thought": thought, "timestamp": ts},
+    ]
+    action_steps = state.get("action_steps", []) + [
+        {"node": "explore", "action": f"Изучение структуры проекта ({len(tree)} строк)", "status": "completed", "timestamp": ts},
+    ]
+
+    return {
+        "error": "",
+        "iterations": state["iterations"] + 1,
+        "thought_steps": thought_steps,
+        "action_steps": action_steps,
+        "chain_of_thought": state.get("chain_of_thought", "") + f"\n## Explore\n{thought}\n",
+        "prompt_tokens": state.get("prompt_tokens", 0) + tokens["prompt_tokens"],
+        "completion_tokens": state.get("completion_tokens", 0) + tokens["completion_tokens"],
+        "model": "deepseek/deepseek-v4-flash",
+    }
 
 
 # ── Узел: выполнение действий (чтение/запись файлов) ────────────
@@ -143,14 +199,25 @@ def execute_actions(state: AgentState):
     ]
 
     changed_files = []
+    action_steps = state.get("action_steps", [])
+    thought_steps = state.get("thought_steps", [])
+    chain_of_thought = state.get("chain_of_thought", "")
+    prompt_tokens = state.get("prompt_tokens", 0)
+    completion_tokens = state.get("completion_tokens", 0)
 
     for _ in range(_MAX_TOOL_CALLS):
         response = llm.invoke(messages)
+
+        # Собираем токены с каждого LLM-вызова
+        tokens = _sum_tokens(response)
+        prompt_tokens += tokens["prompt_tokens"]
+        completion_tokens += tokens["completion_tokens"]
 
         # ── Проверяем наличие tool_calls ──────────────────────
         if hasattr(response, "tool_calls") and response.tool_calls:
             # Добавляем AIMessage в историю (с tool_calls)
             messages.append(response)
+            ts = _now_iso()
 
             for tc in response.tool_calls:
                 tool_name = tc.get("name", "")
@@ -159,10 +226,22 @@ def execute_actions(state: AgentState):
                 # Инструмент done — завершение
                 if tool_name == "done":
                     changed_files = tool_args.get("changed_files", [])
+                    action_steps.append({
+                        "node": "execute",
+                        "action": f"Вызов done() → изменено файлов: {len(changed_files)}",
+                        "status": "completed",
+                        "timestamp": ts,
+                    })
                     return {
                         "success": True,
                         "changed_files": changed_files,
                         "iterations": state["iterations"] + 1,
+                        "thought_steps": thought_steps,
+                        "action_steps": action_steps,
+                        "chain_of_thought": chain_of_thought,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "model": "deepseek/deepseek-v4-flash",
                     }
 
                 # Выполняем инструмент
@@ -178,6 +257,15 @@ def execute_actions(state: AgentState):
                 if not result_text:
                     result_text = f"❌ Инструмент '{tool_name}' не найден"
 
+                # Записываем действие
+                action_summary = result_text[:200].replace("\n", " ")
+                action_steps.append({
+                    "node": "execute",
+                    "action": f"{tool_name}({_fmt_args(tool_args)}) → {action_summary}",
+                    "status": "completed" if not result_text.startswith("❌") else "failed",
+                    "timestamp": ts,
+                })
+
                 messages.append(
                     ToolMessage(content=result_text, tool_call_id=tc["id"])
                 )
@@ -188,11 +276,18 @@ def execute_actions(state: AgentState):
         # ── Нет tool_calls — возможно DONE в тексте ──────────
         content = response.content or ""
         messages.append(AIMessage(content=content))
+        if content.strip():
+            ts = _now_iso()
+            thought_steps.append({
+                "node": "execute",
+                "thought": content[:500],
+                "timestamp": ts,
+            })
+            chain_of_thought += f"\n## Execute\n{content}\n"
 
         if "DONE" in content.upper() or "done" in content.lower():
             break
 
-        # Последний шанс: просим явно вызвать done()
         messages.append(
             HumanMessage(
                 content="Ты не вызвал done(). Если задача выполнена — вызови done() "
@@ -204,7 +299,24 @@ def execute_actions(state: AgentState):
         "success": True,
         "changed_files": changed_files,
         "iterations": state["iterations"] + 1,
+        "thought_steps": thought_steps,
+        "action_steps": action_steps,
+        "chain_of_thought": chain_of_thought,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "model": "deepseek/deepseek-v4-flash",
     }
+
+
+def _fmt_args(args: dict) -> str:
+    """Форматировать аргументы для лога (обрезает длинные значения)."""
+    parts = []
+    for k, v in args.items():
+        v_str = str(v)
+        if len(v_str) > 60:
+            v_str = v_str[:57] + "..."
+        parts.append(f"{k}={v_str}")
+    return ", ".join(parts)
 
 
 # ── Узел: тестирование в Docker ─────────────────────────────────
@@ -212,6 +324,8 @@ def execute_actions(state: AgentState):
 def run_tests(state: AgentState):
     """Запустить тесты проекта в Docker-контейнере."""
     sandbox_dir = state["sandbox_dir"]
+    ts = _now_iso()
+    action_steps = state.get("action_steps", [])
 
     # Определяем тип проекта
     has_requirements = os.path.exists(os.path.join(sandbox_dir, "requirements.txt"))
@@ -226,23 +340,50 @@ def run_tests(state: AgentState):
     else:
         sandbox_type = "unknown"
 
+    action_steps.append({
+        "node": "test",
+        "action": f"Тип проекта: {sandbox_type}. Запуск Docker-тестов...",
+        "status": "running",
+        "timestamp": ts,
+    })
+
     # Устанавливаем зависимости и запускаем тесты
     try:
         result = ProjectSandbox.run_project_tests(sandbox_dir, sandbox_type, task_id=state["task_id"])
     except Exception as e:
+        action_steps.append({
+            "node": "test",
+            "action": f"Ошибка Docker: {e}",
+            "status": "failed",
+            "timestamp": _now_iso(),
+        })
         return {
             "success": False,
             "error": f"Ошибка Docker: {e}",
             "test_passed": False,
+            "action_steps": action_steps,
         }
 
     if result["status"] == "success":
-        return {"success": True, "error": "", "test_passed": True}
+        action_steps.append({
+            "node": "test",
+            "action": "✅ Тесты пройдены",
+            "status": "completed",
+            "timestamp": _now_iso(),
+        })
+        return {"success": True, "error": "", "test_passed": True, "action_steps": action_steps}
     else:
+        action_steps.append({
+            "node": "test",
+            "action": f"❌ Тесты не пройдены: {result['output'][:300]}",
+            "status": "failed",
+            "timestamp": _now_iso(),
+        })
         return {
             "success": False,
             "error": result["output"],
             "test_passed": False,
+            "action_steps": action_steps,
         }
 
 
