@@ -345,14 +345,21 @@ def execute_coding_task_sync(
 
         # Обновляем прогресс после графа
         iterations = final_state.get("iterations", 0)
+        # Рассчитываем CU cost из токенов
+        pt = final_state.get("prompt_tokens", 0)
+        ct = final_state.get("completion_tokens", 0)
+        # deepseek-v4-flash: ~$0.15/M input, ~$0.60/M output
+        cu_cost = (pt * 0.15 + ct * 0.60) / 1_000_000
+
         _update_job_meta(
             current_step="compute_diff", progress=90, iteration=iterations,
             thought_steps=final_state.get("thought_steps", []),
             action_steps=final_state.get("action_steps", []),
             chain_of_thought=final_state.get("chain_of_thought", ""),
-            prompt_tokens=final_state.get("prompt_tokens", 0),
-            completion_tokens=final_state.get("completion_tokens", 0),
+            prompt_tokens=pt,
+            completion_tokens=ct,
             model=final_state.get("model", "deepseek/deepseek-v4-flash"),
+            cu_cost=cu_cost,
         )
 
         # ═══════════════════════════════════════════════════════
@@ -388,6 +395,12 @@ def execute_coding_task_sync(
                 error_traceback=err_tb,
                 current_step="done",
                 progress=100,
+                prompt_tokens=final_state.get("prompt_tokens", 0),
+                completion_tokens=final_state.get("completion_tokens", 0),
+                model=final_state.get("model", "deepseek/deepseek-v4-flash"),
+                thought_steps=final_state.get("thought_steps", []),
+                action_steps=final_state.get("action_steps", []),
+                chain_of_thought=final_state.get("chain_of_thought", ""),
             )
             return _make_result(
                 "failed",
