@@ -297,7 +297,6 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
         except Exception as exc:
             logger.warning(f"Docker: pip install requirements.txt не удался: {exc}")
@@ -315,7 +314,6 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
-                timeout=60,
             )
         except Exception as exc:
             return {"status": "error", "output": f"Не удалось установить pytest: {exc}"}
@@ -333,7 +331,6 @@ class ProjectSandbox:
                 detach=False,
                 stderr=True,
                 stdout=True,
-                timeout=120,
             )
             output = logs.decode("utf-8")
             # Считаем успехом, если нет FAILED (включая "no tests ran")
