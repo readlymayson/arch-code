@@ -362,15 +362,26 @@ def execute_coding_task_sync(
                 log=f"Код успешно сгенерирован. Изменено файлов: {len(changed_files)}.",
             )
         else:
+            # Сохраняем ошибку в meta, чтобы task_state мог её прочитать
+            # даже если RQ result не сохранился (result_ttl истёк)
+            err_msg = final_state.get(
+                "error",
+                "Превышено максимальное число итераций (3) без успеха.",
+            )
+            err_tb = final_state.get("error_traceback", "")
+            _update_job_meta(
+                error=err_msg,
+                error_traceback=err_tb,
+                current_step="done",
+                progress=100,
+            )
             return _make_result(
                 "failed",
                 actual_task_id,
                 iterations=final_state.get("iterations"),
                 changed_files=changed_files,
-                error=final_state.get(
-                    "error",
-                    "Превышено максимальное число итераций (3) без успеха.",
-                ),
+                error=err_msg,
+                error_traceback=err_tb,
             )
 
     finally:
