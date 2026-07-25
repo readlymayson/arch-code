@@ -1,0 +1,31 @@
+[Unit]
+Description=Arch-Code Worker — RQ-воркер фоновых задач (coding_tasks)
+After=network.target redis-server.service
+Wants=redis-server.service
+BindsTo=redis-server.service
+
+[Service]
+Type=simple
+User=dev
+Group=dev
+WorkingDirectory=/home/dev/projects/arch-code
+Environment=PYTHONPATH=/home/dev/projects/arch-code
+Environment=PATH=/home/dev/projects/arch-code/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/dev/projects/arch-code/venv/bin/python /home/dev/projects/arch-code/rq_worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arch-code-worker
+
+# Безопасность
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Лимиты
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
