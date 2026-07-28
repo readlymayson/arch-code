@@ -75,7 +75,7 @@ def _now_iso() -> str:
     return _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime())
 
 
-def _sum_tokens(response) -> dict:
+def _sum_tokens(response: object) -> dict:
     """Извлечь количество токенов из LLM-ответа.
 
     Returns:

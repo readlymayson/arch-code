@@ -80,7 +80,7 @@ def list_files(sandbox_dir: str, path: str = "") -> str:
     return "\n".join(lines) if lines else "(пусто)"
 
 
-def _build_tree(directory: str, prefix: str, lines: list, root_dir: str) -> None:
+def _build_tree(directory: str, prefix: str, lines: list[str], root_dir: str) -> None:
     """Рекурсивно строит дерево."""
     try:
         entries = sorted(os.listdir(directory))

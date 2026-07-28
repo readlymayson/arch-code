@@ -154,7 +154,7 @@ class ChatArchitect:
 
     # ── Streaming-рендеринг ───────────────────────────────────────
 
-    def _render_stream(self, stream):
+    def _render_stream(self, stream: object) -> object:
         """
         Выводит токены в реальном времени.
         Принимает CrewStreamingOutput, возвращает финальный результат.
@@ -188,7 +188,7 @@ class ChatArchitect:
 
     # ── Извлечение кода из результата ─────────────────────────────
 
-    def _extract_code(self, result) -> str:
+    def _extract_code(self, result: object) -> str:
         """Извлекает JS-код из ответа архитектора (ищет markdown-блоки)."""
         raw = str(result)
 

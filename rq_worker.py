@@ -167,13 +167,25 @@ def start_worker() -> int:
     except Exception as exc:
         logger.warning(f"Orphan cleanup error: {exc}")
 
-    worker = Worker(queues, connection=redis_conn, name=worker_name)
-
-    # ── Используем вынесенный обработчик ────────────────────────
-    worker.push_exc_handler(_make_exception_handler(redis_conn))
-
-    logger.info(f"Воркер '{worker_name}' запущен. Ожидание задач...")
-    worker.work(with_scheduler=True)
+    # ── Пытаемся запустить воркер, при дублировании имени — retry ──
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            worker = Worker(queues, connection=redis_conn, name=worker_name)
+            worker.push_exc_handler(_make_exception_handler(redis_conn))
+            logger.info(f"Воркер '{worker_name}' запущен. Ожидание задач...")
+            worker.work(with_scheduler=True)
+            break  # успешно — выходим из цикла
+        except ValueError as e:
+            if "active worker" in str(e).lower():
+                logger.warning(
+                    f"Попытка {attempt}/{max_attempts}: воркер '{worker_name}' уже активен. "
+                    f"Пробую с новым именем..."
+                )
+                # Выбираем новое имя с увеличивающимся суффиксом
+                worker_name = f"arch-code-worker-{hostname}-{os.getpid()}-retry{attempt}"
+            else:
+                raise
 
     return 0
 

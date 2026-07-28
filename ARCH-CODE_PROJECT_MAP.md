@@ -1,7 +1,7 @@
 # 🏗️ ARCH-CODE — PROJECT MAP
 
-> **Назначение:** Гибридная AI-система автоматической генерации Node.js кода на базе CrewAI + LangGraph + DeepSeek V4 с изолированным исполнением в Docker.
-> **Технологии:** Python 3.10+, CrewAI, LangGraph, LangChain, DeepSeek-V4-Flash, Docker SDK, RQ + Redis
+> **Назначение:** Гибридная AI-система автоматической генерации Node.js/Python кода на базе CrewAI + LangGraph + DeepSeek V4 Flash с изолированным исполнением в Docker.
+> **Технологии:** Python 3.10+, CrewAI, LangGraph, LangChain, DeepSeek-V4-Flash (RouterAI), Docker SDK, RQ + Redis
 > **Запуск:** `python chat.py` (интерактивный) или `python main.py` (пакетный)
 
 ---
@@ -13,15 +13,17 @@ arch-code/
 │
 ├── main.py                          # ★ Пакетный режим: CrewAI Agent + Task
 ├── chat.py                          # ★ РЕКОМЕНДУЕМЫЙ вход: интерактивный чат
-├── graph_worker.py                  # ★ LangGraph: generate → test → fix (max 3 итерации)
+├── graph_worker.py                  # ★ LangGraph: explore → execute → test (max 3 итерации)
 ├── docker_manager.py                # ★ Docker-песочница (NodeSandbox + ProjectSandbox)
 ├── worker.py                        # ★ Основной исполнитель: sync/async задачи
 ├── rq_worker.py                     #   RQ-воркер фоновых задач (Redis Queue)
 │
-├── tools/                           # Инструменты CrewAI
+├── tools/                           # Инструменты CrewAI + LangChain
 │   ├── coding_tool.py               #   LangGraphCodingTool — обёртка графа в CrewAI Tool
 │   ├── knowledge_reader.py          #   ReadKnowledgeTool — чтение knowledge/ агентом
-│   └── file_tools.py                #   FileManagementTools — list/read/write в sandbox
+│   ├── file_tools.py                #   Функции управления файлами в sandbox:
+│   │                                 #   list_files, read_file, write_file, make_coding_tools()
+│   └── test_generator.py            #   ★ TDD Agent — генерация pytest до написания кода
 │
 ├── knowledge/                       # ★ База знаний для AI-агентов
 │   ├── agents-architecture.md       #   План развития: 1 агент → 3 агента (Architect/Coder/Tester)
@@ -33,17 +35,55 @@ arch-code/
 │   │   ├── app.js                   #   Сгенерированный код
 │   │   ├── package.json             #   package.json (авто)
 │   │   └── node_modules/            #   Установленные зависимости
-│   └── ...                          #   Множество sandbox-директорий
+│   ├── task_*/                      #   Копии ai-core проекта (Python, с tests/)
+│   └── ...                          #   Всего ~13 sandbox-директорий
+│
+├── tests/                           # ★ Тесты (12 файлов, ~147+ тестов)
+│   ├── conftest.py                  #   Общие фикстуры (temp_sandbox, mock_env)
+│   ├── test_chat_full.py            #   15 тестов — ChatArchitect
+│   ├── test_coding_tool.py          #   10 тестов — LangGraphCodingTool
+│   ├── test_docker_manager_mock.py  #   14 тестов — Docker SDK mocked
+│   ├── test_docker_manager_pure.py  #   12 тестов — Pure functions
+│   ├── test_file_tools.py           #   27 тестов — File operations
+│   ├── test_graph_worker_nodes.py   #   18 тестов — LangGraph nodes
+│   ├── test_graph_worker_pure.py    #   14 тестов — Pure functions
+│   ├── test_knowledge_reader.py     #   8 тестов — ReadKnowledgeTool
+│   ├── test_rq_worker.py            #   9 тестов — RQ worker
+│   ├── test_worker_and_chat.py      #   14 тестов — Worker + Chat integration
+│   └── test_worker_pure.py          #   6 тестов — Pure functions
 │
 ├── logs/                            # Логи
 │   ├── worker.log                   #   RQ worker — операции
-│   └── worker_error.log             #   RQ worker — ошибки
+│   ├── worker_error.log             #   RQ worker — ошибки
+│   ├── worker_new.log               #   Обновлённый лог операций
+│   └── worker_runtime.log           #   Runtime логи
+│
+├── htmlcov/                         # Coverage HTML отчёты (16 файлов)
+│
+├── .qwen/                           # Qwen skills (3 шт.)
+│   └── skills/
+│       ├── ai-agent-framework-decision/SKILL.md
+│       ├── hybrid-ai-coder-system/SKILL.md
+│       └── qwen-md-generation-workflow/SKILL.md
+│
+├── .github/                         # CI/CD
+│   └── workflows/
+│       └── tests.yml                #   GitHub Actions: pytest + Codecov
 │
 ├── .env                             # API-ключи (gitignored)
-├── requirements.txt                 # 9 Python-зависимостей
-├── QWEN.md                          # Контекст для Qwen Code
-├── README.md                        # Полная документация
-└── .qwen/                           # Конфигурация Qwen (skills, settings)
+├── requirements.txt                 # 10 зависимостей (crewai, langgraph, docker, rq, loguru)
+├── requirements-test.txt            # Тестовые зависимости (pytest, fakeredis)
+├── pyproject.toml                   # Coverage config (fail_under=50)
+├── pytest.ini                       # asyncio_mode=auto
+├── Makefile                         # test targets
+├── arch-code-worker.service         # systemd unit для RQ worker
+├── repomix-output.xml               # Полный дамп репозитория для AI
+├── QWEN.md                          # Контекст для AI-ассистента
+├── README.md
+├── ARCH-CODE_PROJECT_MAP.md         # ★ Этот файл
+├── =0.7.0 / =1.15.0                 # Бинарные файлы (версии)
+├── nohup.out                        # Вывод фонового запуска
+└── venv/                            # Виртуальное окружение Python
 ```
 
 ---
@@ -69,17 +109,21 @@ arch-code/
                     │  │ ReadKnowledge │   │
                     │  │ LangGraphCode│   │
                     │  │ FileTools    │   │
+                    │  │ TestGen      │   │
                     │  └──────────────┘   │
                     └──────────┬───────────┘
                                │ LangGraphCodingTool
                     ┌──────────▼───────────┐
                     │     LangGraph        │
                     │  ┌─────────────────┐ │
-                    │  │  explore_project│ │
+                    │  │ explore_project │ │
                     │  └────────┬────────┘ │
                     │           │          │
                     │  ┌────────▼────────┐ │
-                    │  │ execute_actions │──┐
+                    │  │ execute_actions │─┐│
+                    │  │ (max 25 tool    │ ││
+                    │  │  calls, цикл    │ ││
+                    │  │  до DONE)       │ ││
                     │  └────────┬────────┘ ││
                     │           │          ││
                     │  ┌────────▼────────┐ ││
@@ -117,13 +161,14 @@ arch-code/
    │   ├── TEXT — вывод токенов пользователю
    │   └── TOOL_CALL — вызов LangGraphCodingTool
    │         └── graph_worker.workflow
-   │               ├── explore_project — изучение проекта
-   │               ├── execute_actions — чтение/запись файлов
-   │               └── test_code — запуск тестов в Docker
+   │               ├── explore_project — изучение проекта (дерево)
+   │               ├── execute_actions — чтение/запись файлов (bind_tools, цикл до DONE)
+   │               └── test_code — запуск тестов в Docker (авто-детект Python/Node)
    └── Сохраняет результат в last_code
 
-3. LangGraph: generate → test → fix (до 3 итераций)
-    └── Docker: npm install → node app.js / node --test
+3. LangGraph: explore (bind_tools) → execute (max 25 tool calls) → test (Docker)
+    └── До 3 итераций при ошибках
+    └── Docker: pip install / npm install → pytest / node --test
 ```
 
 ---
@@ -133,24 +178,24 @@ arch-code/
 ### `chat.py` — ChatArchitect (рекомендуемый вход)
 | Метод | Назначение |
 |-------|-----------|
-| `__init__()` | LLM (DeepSeek-V4-Flash), tools (knowledge + coding), история |
+| `__init__()` | LLM (DeepSeek-V4-Flash), tools (knowledge + coding + file), история |
 | `_build_context()` | Сборка контекста: sandbox-файлы + история + код + user input |
 | `_create_agent()` | Создание CrewAI Architect Agent |
 | `_render_stream()` | Стриминг токенов (TEXT, TOOL_CALL) в реальном времени |
-| `_extract_code()` | Извлечение JS-кода из markdown |
 | `run()` | Основной entry: контекст → crew → kickoff → сохранение |
 | `chat_loop()` | Интерактивный REPL: `/docs`, `/code`, `/sandbox`, `/clear`, `/exit` |
+| Одноразовый режим | `python chat.py "task description"` — без цикла |
 
 ### `graph_worker.py` — LangGraph
 
 | Узел (Node) | Тип | Описание |
 |-------------|-----|----------|
 | `explore_project` | LangGraph Node | Показывает AI дерево проекта |
-| `execute_actions` | LangGraph Node | AI читает/пишет файлы (JSON tool calls, цикл до DONE) |
+| `execute_actions` | LangGraph Node | AI читает/пишет файлы (LangChain bind_tools, цикл до DONE, макс 25 tool calls) |
 | `test_code` | LangGraph Node | Детект типа проекта → запуск тестов в Docker |
-| `route_next_step` | Conditional Edge | END если success или ≥3 итераций, иначе execute |
+| `route_next_step` | Conditional Edge | END если success или ≥3 итераций, иначе execute_actions |
 
-**AgentState (TypedDict):** `task_id`, `sandbox_dir`, `project_dir`, `task`, `code`, `test_code`, `test_passed`, `error`, `iterations`, `success`, `changed_files`
+**AgentState (TypedDict):** 17 полей: `task_id`, `sandbox_dir`, `project_dir`, `task`, `code`, `test_code`, `test_passed`, `error`, `iterations`, `success`, `changed_files`, `thought_steps`, `action_steps`, `chain_of_thought`, `prompt_tokens`, `completion_tokens`, `model`
 
 ### `docker_manager.py` — Docker-песочница
 
@@ -163,27 +208,37 @@ arch-code/
 | | `cleanup()` | Удаление sandbox-директории |
 | **ProjectSandbox** | `detect_project_type()` | Авто-детект Python (requirements.txt) / Node (package.json) |
 | | `run_project_tests()` | Установка зависимостей + тесты в Docker |
-| | `_run_python_tests()` | pip install → pytest -x в python:3.12-slim |
+| | `_run_python_tests()` | pip install лишь pytest+pytest-timeout → pytest -x в python:3.12-slim |
 | | `_run_node_tests()` | npm install → npm test в node:alpine |
+| | `cleanup_containers()` | Остановка и удаление Docker контейнеров |
 
 ### `worker.py` — Исполнитель задач
 
 | Функция | Описание |
 |---------|----------|
-| `sync_project_to_sandbox()` | Rsync проекта (ai-core) в sandbox с exclude-паттернами |
+| `sync_project_to_sandbox()` | Rsync проекта (ai-core по умолч.) в sandbox с exclude-паттернами |
 | `compute_sandbox_diff()` | Git diff изменений в sandbox |
-| `execute_coding_task_sync()` | ★ Основная: sync → LangGraph → diff → результат |
+| `execute_coding_task_sync()` | ★ Основная: sync → git init → LangGraph → diff → валидация Python → результат |
 | `execute_coding_task()` | async-обёртка для thread pool |
+| Расчёт CU | `(prompt_tokens * 0.15 + completion_tokens * 0.60) / 1_000_000` |
+| Graceful shutdown | SIGTERM handler, _cleanup_resources() |
 
 ### `rq_worker.py` — Фоновый воркер
 
 | Функция | Описание |
 |---------|----------|
-| `start_worker()` | Redis → RQ Worker(queue=`coding_tasks`) с обработкой ошибок |
+| `start_worker()` | Redis → RQ Worker(queue=`coding_tasks`), stale-keys cleanup |
+| `cleanup_orphaned_jobs()` | Чистка Docker + sandbox ресурсов |
+| Exception handler | Fallback cleanup при сбоях |
+| Retry | 3 попытки при коллизии имени воркера |
 
 ### `main.py` — Пакетный режим
 - CrewAI: Architect Agent + hardcoded Task (Express.js webhook)
 - `Process.sequential` — последовательное выполнение
+
+### `tools/test_generator.py` — TDD Agent
+- Генерация pytest-тестов ДО написания кода (RED → GREEN)
+- LLM-генерация, валидация `ast.parse()`, graceful degradation (2 retries)
 
 ---
 
@@ -191,13 +246,31 @@ arch-code/
 
 | Параметр | Значение |
 |----------|----------|
-| Провайдер | RouterAI (`api.routerai.ru/api/v1`) + DeepSeek direct |
-| Модель | `deepseek-chat` (chat.py, main.py) / `deepseek-v4-flash` (graph_worker.py) |
+| Провайдер | RouterAI (`api.routerai.ru/api/v1`) |
+| Модель | `deepseek/deepseek-v4-flash` (все файлы) |
 | Температура | По умолчанию LLM |
 | Язык промптов | Русский (все agent/role/task инструкции) |
 | API-ключ | `ROUTERAI_API_KEY` в `.env` |
 
 ---
+
+## 🧪 ТЕСТЫ (12 файлов, ~147+ тестов)
+
+| Файл | Тип | Кол-во |
+|------|-----|--------|
+| `test_file_tools.py` | Pure functions | 27 |
+| `test_graph_worker_pure.py` | Pure functions | 14 |
+| `test_docker_manager_pure.py` | Pure functions | 12 |
+| `test_worker_pure.py` | Pure functions | 6 |
+| `test_rq_worker.py` | Pure functions | 9 |
+| `test_knowledge_reader.py` | Pure functions | 8 |
+| `test_coding_tool.py` | Pure functions | 10 |
+| `test_graph_worker_nodes.py` | Mocked (LangGraph) | 18 |
+| `test_docker_manager_mock.py` | Mocked (Docker SDK) | 14 |
+| `test_worker_and_chat.py` | Integration | 14 |
+| `test_chat_full.py` | Integration | 15 |
+
+> CI: `.github/workflows/tests.yml` — `pytest -m "not integration and not slow"` + Codecov
 
 ## 🛠️ ИНСТРУМЕНТЫ CREWAI
 

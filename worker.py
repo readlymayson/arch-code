@@ -56,7 +56,7 @@ def _update_job_meta(**updates):
         job.meta = meta
         job.save_meta()
     except Exception:
-        pass  # Job meta — опционально, не должно ломать воркер
+        logger.warning("Job meta update failed", exc_info=True)
 
 
 # ── Константы ────────────────────────────────────────────────────
@@ -368,6 +368,35 @@ def execute_coding_task_sync(
 
         changed_files = compute_sandbox_diff(sandbox_dir)
 
+        # ── Очистка __pycache__ из sandbox перед фиксацией результата ──
+        try:
+            import shutil as _shutil
+            for _root, _dirs, _files in os.walk(sandbox_dir):
+                if "__pycache__" in _dirs:
+                    _shutil.rmtree(os.path.join(_root, "__pycache__"), ignore_errors=True)
+                    _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+        except Exception:
+            pass
+
+        # ── Валидация синтаксиса изменённых Python-файлов ────────────
+        validation_errors = []
+        for entry in changed_files:
+            if entry["status"] in ("added", "modified") and entry["path"].endswith(".py"):
+                file_path = os.path.join(sandbox_dir, entry["path"])
+                if os.path.isfile(file_path):
+                    try:
+                        import py_compile
+                        py_compile.compile(file_path, doraise=True)
+                    except py_compile.PyCompileError as e:
+                        validation_errors.append({"path": entry["path"], "error": str(e)})
+
+        if validation_errors:
+            logger.warning(
+                f"⚠️ Синтаксические ошибки в {len(validation_errors)} файлах:"
+            )
+            for ve in validation_errors:
+                logger.warning(f"   • {ve['path']}: {ve['error']}")
+
         sandbox_path = f"sandbox/{actual_task_id}/"
 
         _update_job_meta(current_step="done", progress=100)
@@ -420,7 +449,7 @@ def execute_coding_task_sync(
         try:
             _publish_result_notification(actual_task_id)
         except Exception:
-            pass  # не критично, ai-core подхватит fallback polling
+            logger.warning("Pub/sub notification failed", exc_info=True)
 
         # ═══════════════════════════════════════════════════════
         # Очистка ресурсов (гарантированно выполняется)
@@ -440,7 +469,7 @@ def _publish_result_notification(task_id: str) -> None:
         r.publish("coding_tasks:results", task_id)
         r.close()
     except Exception:
-        pass  # fallback polling в ai-core подхватит
+        logger.warning(f"Redis pub/sub notification failed for {task_id}", exc_info=True)  # fallback polling в ai-core подхватит
 
 
 def _cleanup_resources(task_id: str, sandbox_dir: str) -> None:
@@ -455,7 +484,7 @@ def _cleanup_resources(task_id: str, sandbox_dir: str) -> None:
         # Останавливаем и удаляем Docker-контейнеры задачи
         cleanup_containers(task_id)
     except Exception as exc:
-        print(f"worker: ошибка очистки Docker для {task_id}: {exc}", file=sys.stderr)
+        logger.warning(f"Ошибка очистки Docker для {task_id}: {exc}")
 
     # Удаляем sandbox-директорию
     if sandbox_dir and os.path.exists(sandbox_dir):
@@ -463,13 +492,13 @@ def _cleanup_resources(task_id: str, sandbox_dir: str) -> None:
             import shutil
             shutil.rmtree(sandbox_dir, ignore_errors=True)
         except Exception as exc:
-            print(f"worker: ошибка удаления sandbox {task_id}: {exc}", file=sys.stderr)
+            logger.warning(f"Ошибка удаления sandbox {task_id}: {exc}")
 
     # Отмечаем очистку в job.meta
     try:
         _update_job_meta(cleanup_completed=True)
     except Exception:
-        pass
+        logger.debug("Cleanup meta update failed (non-critical)")
 
 
 # ── async-обёртка для ai-core (чтобы не блокировать event loop) ──
