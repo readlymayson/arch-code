@@ -33,3 +33,13 @@ venv/
 logs/
 =0.7.0
 =1.15.0
+
+# Coverage
+.coverage
+.coverage.*
+
+# Runtime
+nohup.out
+
+# Generated docs
+repomix-output.xml

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -129,6 +131,17 @@ def start_worker() -> int:
             "Необработанное исключение в воркере:\n"
             + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         )
+        # Снимаем lock, если воркер падает с необработанным исключением.
+        # Имена могут быть ещё не определены (исключение до инициализации lock) —
+        # закрываем try/except.
+        try:
+            _lock_refresh_stop.set()
+        except Exception:
+            pass
+        try:
+            _release_worker_lock()
+        except Exception:
+            pass
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _global_exception_hook
@@ -150,9 +163,65 @@ def start_worker() -> int:
     hostname = socket.gethostname()
     worker_name = f"arch-code-worker-{hostname}-{os.getpid()}"
 
+    # ── Redis SETNX lock: защита от дублирующихся воркеров ──────────
+    # Атомарный setnx предотвращает запуск второго воркера при рестартах
+    # systemd (когда старый процесс ещё не успел очистить rq:worker:* ключи).
+    # TTL 30 секунд — если воркер жив дольше, lock обновляется в фоне.
+    LOCK_KEY = "worker:arch-code:lock"
+    LOCK_TTL = 30  # секунд
+    acquired = redis_conn.set(LOCK_KEY, str(os.getpid()), nx=True, ex=LOCK_TTL)
+    if not acquired:
+        owner_pid = redis_conn.get(LOCK_KEY)
+        owner_pid = owner_pid.decode("utf-8") if isinstance(owner_pid, bytes) else owner_pid
+        logger.error(
+            f"❌ Другой воркер arch-code уже активен (lock владеет PID={owner_pid}). "
+            f"Выход. Если это stale-lock — удалите ключ {LOCK_KEY} вручную."
+        )
+        return 1
+
+    def _release_worker_lock():
+        """Снять lock, только если мы его владелец (сравнение по PID)."""
+        try:
+            current = redis_conn.get(LOCK_KEY)
+            current = current.decode("utf-8") if isinstance(current, bytes) else current
+            if current == str(os.getpid()):
+                redis_conn.delete(LOCK_KEY)
+                logger.info(f"Lock {LOCK_KEY} снят (PID {os.getpid()})")
+        except Exception as exc:
+            logger.warning(f"Не удалось снять lock {LOCK_KEY}: {exc}")
+
+    # Фоновый тред продлевает TTL, пока воркер жив
+    _lock_refresh_stop = threading.Event()
+
+    def _lock_refresh_loop():
+        while not _lock_refresh_stop.is_set():
+            try:
+                redis_conn.expire(LOCK_KEY, LOCK_TTL)
+            except Exception:
+                pass
+            _lock_refresh_stop.wait(LOCK_TTL // 2)
+
+    _lock_refresh_thread = threading.Thread(
+        target=_lock_refresh_loop, daemon=True, name="worker-lock-refresh"
+    )
+    _lock_refresh_thread.start()
+    logger.info(f"Воркер-лок {LOCK_KEY} захвачен (PID {os.getpid()}, TTL {LOCK_TTL}s)")
+
     # ── Очищаем stale-воркеров ─────────────────────────────────
     try:
-        stale_keys = redis_conn.keys("rq:worker:arch-code-worker*")
+        # Используем SCAN вместо KEYS для production-безопасности,
+        # ищем все stale ключи воркеров arch-code
+        stale_keys = []
+        cursor = 0
+        while True:
+            cursor, batch = redis_conn.scan(
+                cursor=cursor,
+                match="rq:worker:arch-code-worker*",
+                count=100,
+            )
+            stale_keys.extend(batch)
+            if cursor == 0:
+                break
         if stale_keys:
             redis_conn.delete(*stale_keys)
             logger.warning(f"Очищено {len(stale_keys)} stale-ключей воркера из Redis")
@@ -167,25 +236,68 @@ def start_worker() -> int:
     except Exception as exc:
         logger.warning(f"Orphan cleanup error: {exc}")
 
+    # ── PID-файл для systemd / ручного контроля ──────────────────
+    PID_FILE = Path(PROJECT_ROOT / "rq_worker.pid")
+    if PID_FILE.exists():
+        try:
+            old_pid = PID_FILE.read_text().strip()
+            logger.warning(f"Найден старый PID-файл: PID={old_pid}, удаляю")
+            PID_FILE.unlink()
+        except Exception:
+            pass
+    try:
+        PID_FILE.write_text(str(os.getpid()))
+        logger.info(f"PID {os.getpid()} записан в {PID_FILE}")
+    except Exception as exc:
+        logger.warning(f"Не удалось записать PID-файл: {exc}")
+
+    import signal as _signal
+
+    def _shutdown_handler(signum, frame):
+        """Graceful shutdown: чистим Redis-ключи, lock и PID-файл."""
+        logger.info(f"Получен сигнал {signum}, завершение воркера...")
+        try:
+            worker_key = f"rq:worker:{worker_name}"
+            redis_conn.delete(worker_key)
+            logger.info(f"Ключ воркера {worker_key} очищен")
+        except Exception:
+            pass
+        _lock_refresh_stop.set()
+        _release_worker_lock()
+        try:
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _shutdown_handler)
+    _signal.signal(_signal.SIGINT, _shutdown_handler)
+
     # ── Пытаемся запустить воркер, при дублировании имени — retry ──
     max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            worker = Worker(queues, connection=redis_conn, name=worker_name)
-            worker.push_exc_handler(_make_exception_handler(redis_conn))
-            logger.info(f"Воркер '{worker_name}' запущен. Ожидание задач...")
-            worker.work(with_scheduler=True)
-            break  # успешно — выходим из цикла
-        except ValueError as e:
-            if "active worker" in str(e).lower():
-                logger.warning(
-                    f"Попытка {attempt}/{max_attempts}: воркер '{worker_name}' уже активен. "
-                    f"Пробую с новым именем..."
-                )
-                # Выбираем новое имя с увеличивающимся суффиксом
-                worker_name = f"arch-code-worker-{hostname}-{os.getpid()}-retry{attempt}"
-            else:
-                raise
+    try:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                worker = Worker(queues, connection=redis_conn, name=worker_name)
+                worker.push_exc_handler(_make_exception_handler(redis_conn))
+                logger.info(f"Воркер '{worker_name}' запущен. Ожидание задач...")
+                worker.work(with_scheduler=True)
+                break  # успешно — выходим из цикла
+            except ValueError as e:
+                if "active worker" in str(e).lower():
+                    logger.warning(
+                        f"Попытка {attempt}/{max_attempts}: воркер '{worker_name}' уже активен. "
+                        f"Пробую с новым именем..."
+                    )
+                    # Выбираем новое имя с увеличивающимся суффиксом
+                    worker_name = f"arch-code-worker-{hostname}-{os.getpid()}-retry{attempt}"
+                else:
+                    raise
+    finally:
+        # Воркер завершился (worker.work вернулся или упал) — снимаем lock
+        _lock_refresh_stop.set()
+        _release_worker_lock()
 
     return 0
 
