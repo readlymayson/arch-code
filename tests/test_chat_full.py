@@ -260,14 +260,13 @@ class TestRun:
 class TestShowDocs:
     """Показ документации из knowledge/."""
 
-    def test_knowledge_found(self, mock_env, tmp_path, capsys):
+    def test_knowledge_found(self, mock_env, tmp_path, capsys, monkeypatch):
         """knowledge/ с .md файлами."""
         knowledge_dir = tmp_path / "knowledge"
         knowledge_dir.mkdir()
         (knowledge_dir / "guide.md").write_text("# Guide\nLine1\nLine2\n")
 
         import chat as chat_module
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(chat_module, "__file__", os.path.join(str(tmp_path), "chat.py"))
 
         # Подменяем os.path.dirname(__file__) внутри show_docs через подмену знания
@@ -287,11 +286,10 @@ class TestShowDocs:
         assert "guide.md" in captured.out
         assert "Guide" in captured.out
 
-    def test_knowledge_empty(self, mock_env, capsys, tmp_path):
+    def test_knowledge_empty(self, mock_env, capsys, tmp_path, monkeypatch):
         """knowledge/ пустая."""
         from chat import show_docs
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr("chat.os.listdir", lambda p: [] if "knowledge" in str(p) else [])
         monkeypatch.setattr("chat.os.path.exists", lambda p: True)
 
@@ -300,11 +298,10 @@ class TestShowDocs:
         captured = capsys.readouterr()
         assert "нет .md" in captured.out or "не найдена" in captured.out
 
-    def test_knowledge_not_found(self, mock_env, capsys):
+    def test_knowledge_not_found(self, mock_env, capsys, monkeypatch):
         """knowledge/ не существует."""
         from chat import show_docs
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr("chat.os.path.exists", lambda p: False)
 
         show_docs()
@@ -352,11 +349,10 @@ class TestShowCode:
 class TestShowSandbox:
     """Показ файлов в sandbox/."""
 
-    def test_sandbox_not_found(self, mock_env, capsys):
+    def test_sandbox_not_found(self, mock_env, capsys, monkeypatch):
         """sandbox/ не существует."""
         from chat import show_sandbox
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr("chat.os.path.isdir", lambda p: False)
         monkeypatch.setattr("chat.os.path.dirname", lambda p: "/tmp")
 

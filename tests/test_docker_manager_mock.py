@@ -214,12 +214,8 @@ class TestRunPythonTests:
         # Мокаем docker.from_env
         mocker.patch("docker.from_env", return_value=mock_client)
 
-        # Два запуска (pip install + pip install pytest + pytest)
-        mock_client.containers.run.side_effect = [
-            b"",  # pip install
-            b"",  # pip install pytest
-            mock_container,  # pytest run
-        ]
+        # Один объединённый запуск (pip install + pytest в одном sh -c)
+        mock_client.containers.run.return_value = b"collected 5 items ... 5 passed"
         mock_client.containers.get.side_effect = __import__("docker").errors.NotFound("not found")
 
         result = ProjectSandbox._run_python_tests(str(tmp_path), "task-123")
@@ -232,12 +228,8 @@ class TestRunPythonTests:
 
         mock_client = mocker.MagicMock()
         mocker.patch("docker.from_env", return_value=mock_client)
-        # Возвращаем bytes напрямую (run возвращает logs.decode())
-        mock_client.containers.run.side_effect = [
-            b"",  # pip install
-            b"",  # pip install pytest
-            b"FAILED test_app.py::test_foo - AssertionError",  # pytest run (bytes directly)
-        ]
+        # Один объединённый запуск, вывод содержит FAILED
+        mock_client.containers.run.return_value = b"FAILED test_app.py::test_foo - AssertionError"
         mock_client.containers.get.side_effect = docker.errors.NotFound("not found")
 
         result = ProjectSandbox._run_python_tests(str(tmp_path), "task-456")

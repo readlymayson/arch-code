@@ -18,6 +18,8 @@ import threading
 import uuid
 from typing import Any, Dict, Optional
 
+from loguru import logger
+
 from graph_worker import coding_graph
 from tools.file_tools import RSYNC_EXCLUDE_PATTERNS
 

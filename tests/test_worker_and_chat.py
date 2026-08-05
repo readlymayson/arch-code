@@ -35,12 +35,20 @@ import pytest
 class TestExecuteCodingTaskSync:
     """execute_coding_task_sync — оркестратор LangGraph-цикла."""
 
-    def test_success(self, mocker, mock_env):
-        """Успешный прогон: rsync → graph.invoke → diff → success."""
+    def test_success(self, mocker, mock_env, tmp_path):
+        """Успешный прогон: sync → git init → graph.invoke → diff → success."""
         from worker import execute_coding_task_sync
 
-        # Mock sync
-        mocker.patch("worker.sync_project_to_sandbox", return_value="/tmp/sandbox/test")
+        # Реальный sandbox dir (нужен для git init и compute_sandbox_diff)
+        sandbox_dir = tmp_path / "sandbox" / "unit-test-001"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        # Mock sync — возвращаем существующий путь
+        mocker.patch("worker.sync_project_to_sandbox", return_value=str(sandbox_dir))
+        # Mock git init/config/add/commit (Phase 4: инициализация git в sandbox)
+        mocker.patch("worker.subprocess.run", return_value=None)
+        # Mock TDD-генератор (Phase 4: tools.test_generator)
+        mocker.patch("tools.test_generator.generate_tests_for_task", return_value=[])
         # Mock graph
         mock_graph = mocker.patch("worker.coding_graph")
         mock_graph.invoke.return_value = {
@@ -60,6 +68,8 @@ class TestExecuteCodingTaskSync:
         mocker.patch("worker._publish_result_notification")
         # Mock update_job_meta
         mocker.patch("worker._update_job_meta")
+        # Mock deliverable builder (zip)
+        mocker.patch("tools.deliverable_builder.build_zip", return_value="/tmp/unit-test-001.zip")
 
         result = execute_coding_task_sync(
             task_description="Add hello endpoint",
@@ -92,11 +102,16 @@ class TestExecuteCodingTaskSync:
         assert result["status"] == "error"
         assert "rsync" in result.get("error", "")
 
-    def test_graph_error(self, mocker, mock_env):
+    def test_graph_error(self, mocker, mock_env, tmp_path):
         """Ошибка графа → status='error'."""
         from worker import execute_coding_task_sync
 
-        mocker.patch("worker.sync_project_to_sandbox", return_value="/tmp/sandbox/test")
+        sandbox_dir = tmp_path / "sandbox" / "graph-crash"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        mocker.patch("worker.sync_project_to_sandbox", return_value=str(sandbox_dir))
+        mocker.patch("worker.subprocess.run", return_value=None)
+        mocker.patch("tools.test_generator.generate_tests_for_task", return_value=[])
         mock_graph = mocker.patch("worker.coding_graph")
         mock_graph.invoke.side_effect = Exception("Graph crashed")
         mocker.patch("worker.compute_sandbox_diff", return_value=[])
@@ -112,11 +127,16 @@ class TestExecuteCodingTaskSync:
         assert result["status"] == "error"
         assert "Graph crashed" in result.get("error", "")
 
-    def test_cleanup_called_in_finally(self, mocker, mock_env):
+    def test_cleanup_called_in_finally(self, mocker, mock_env, tmp_path):
         """cleanup вызывается в finally блоке (даже при ошибке)."""
         from worker import execute_coding_task_sync
 
-        mocker.patch("worker.sync_project_to_sandbox", return_value="/tmp/sandbox/test")
+        sandbox_dir = tmp_path / "sandbox" / "cleanup-check"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        mocker.patch("worker.sync_project_to_sandbox", return_value=str(sandbox_dir))
+        mocker.patch("worker.subprocess.run", return_value=None)
+        mocker.patch("tools.test_generator.generate_tests_for_task", return_value=[])
         mock_graph = mocker.patch("worker.coding_graph")
         mock_graph.invoke.return_value = {"success": True, "iterations": 1,
                                            "code": "", "error": "",
