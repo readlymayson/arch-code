@@ -341,6 +341,32 @@ def execute_coding_task_sync(
     # ── try/finally гарантирует очистку ресурсов ──────────────
     try:
 
+        # ═══════════════════════════════════════════════════════
+        # 1d. TDD: генерация тестов по ТЗ (до реализации)
+        #     Активирует модуль tools/test_generator.py (ранее не подключён).
+        #     Тесты пишутся в tests/test_generated_{task_id}.py, попадают
+        #     в changed_files и запускаются run_tests в Docker.
+        #     Graceful: при сбое генерации — пустая строка, граф работает без TDD.
+        # ═══════════════════════════════════════════════════════
+        _update_job_meta(current_step="tdd", progress=8, iteration=0)
+        if not test_code:
+            try:
+                from tools.test_generator import generate_tests_for_task
+                generated_tests = generate_tests_for_task(
+                    task=task_description,
+                    sandbox_dir=sandbox_dir,
+                    task_id=actual_task_id,
+                )
+                if generated_tests:
+                    _update_job_meta(
+                        current_step="tdd",
+                        progress=9,
+                        tdd_generated=True,
+                        tdd_tests=len(generated_tests),
+                    )
+            except Exception as tdd_exc:
+                logger.warning(f"TDD: ошибка активации генератора тестов: {tdd_exc}")
+
         initial_state = {
             "task_id": actual_task_id,
             "sandbox_dir": sandbox_dir,
@@ -454,6 +480,29 @@ def execute_coding_task_sync(
 
         _update_job_meta(current_step="done", progress=100)
 
+        # ═══════════════════════════════════════════════════════
+        # 4. Сборка deliverable (zip) ДО очистки sandbox
+        #    Использует changed_files[].content — работает даже после
+        #    удаления песочницы (cleanup в finally).
+        # ═══════════════════════════════════════════════════════
+        deliverable_path = None
+        try:
+            from tools.deliverable_builder import build_zip
+
+            deliverable_path = build_zip(
+                task_id=actual_task_id,
+                changed_files=changed_files,
+                output_dir=os.path.join(PROJECT_ROOT, "deliverables"),
+                task_description=task_description,
+                summary=(
+                    final_state.get("chain_of_thought", "")[:500]
+                    if final_state.get("success")
+                    else "Решение не завершено полностью (см. лог)."
+                ),
+            )
+        except Exception as zip_exc:
+            logger.warning(f"Deliverable: не удалось собрать архив: {zip_exc}")
+
         if final_state.get("success"):
             return _make_result(
                 "success",
@@ -462,6 +511,7 @@ def execute_coding_task_sync(
                 code=final_state.get("code", ""),
                 changed_files=changed_files,
                 generated_files_dir=sandbox_path,
+                deliverable_path=deliverable_path,
                 log=f"Код успешно сгенерирован. Изменено файлов: {len(changed_files)}.",
             )
         else:
@@ -489,6 +539,7 @@ def execute_coding_task_sync(
                 actual_task_id,
                 iterations=final_state.get("iterations"),
                 changed_files=changed_files,
+                deliverable_path=deliverable_path,
                 error=err_msg,
                 error_traceback=err_tb,
             )
