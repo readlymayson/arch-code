@@ -32,8 +32,42 @@ def _get_llm() -> ChatOpenAI:
             model="deepseek/deepseek-v4-flash",
             api_key=os.getenv("ROUTERAI_API_KEY"),
             base_url=os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1"),
+            timeout=float(os.getenv("ARCH_CODE_LLM_TIMEOUT", "120")),
+            max_retries=1,
         )
     return _flash_llm
+
+
+def _invoke_llm(llm, messages, *, timeout: float = 120.0):
+    """Вызвать LLM с жёстким таймаутом.
+
+    RouterAI иногда отвечает медленно (несколько минут). Без таймаута
+    задача висит на шаге explore, пока RQ не убьёт её по job_timeout
+    (600 сек), — и пользователь видит '❌ Ошибка за 0 сек на 10%'.
+
+    Args:
+        llm: Экземпляр ChatOpenAI (или bind_tools()).
+        messages: Сообщения для invoke.
+        timeout: Максимальное время ожидания ответа (сек).
+
+    Returns:
+        Ответ LLM (AIMessage / ChatResult).
+
+    Raises:
+        TimeoutError: Если LLM не ответил за timeout секунд.
+    """
+    import concurrent.futures as _cf
+
+    with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(llm.invoke, messages)
+        try:
+            return future.result(timeout=timeout)
+        except _cf.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"LLM не ответил за {timeout}с "
+                f"(RouterAI/DeepSeek V4 Flash) — таймаут"
+            )
 
 
 # ── Фильтр cp1251-несовместимых символов ─────────────────────────
@@ -122,7 +156,7 @@ def explore_project(state: AgentState):
         "Какие файлы тебе нужно прочитать для начала работы?"
     )
 
-    response = _get_llm().invoke(prompt)
+    response = _invoke_llm(_get_llm(), prompt, timeout=LLM_TIMEOUT)
     thought = getattr(response, "content", str(response))[:500]
     tokens = _sum_tokens(response)
 
@@ -150,6 +184,10 @@ def explore_project(state: AgentState):
 
 # Максимальное количество вызовов инструментов в одном узле
 _MAX_TOOL_CALLS = 25
+
+# Таймаут на один LLM-вызов (сек). RouterAI/DeepSeek V4 Flash иногда
+# отвечает медленно; жёсткий таймаут не даёт задаче зависнуть навсегда.
+LLM_TIMEOUT = float(os.getenv("ARCH_CODE_LLM_TIMEOUT", "120"))
 
 
 def execute_actions(state: AgentState):
@@ -206,7 +244,7 @@ def execute_actions(state: AgentState):
     completion_tokens = state.get("completion_tokens", 0)
 
     for _ in range(_MAX_TOOL_CALLS):
-        response = llm.invoke(messages)
+        response = _invoke_llm(llm, messages, timeout=LLM_TIMEOUT)
 
         # Собираем токены с каждого LLM-вызова
         tokens = _sum_tokens(response)

@@ -43,3 +43,6 @@ nohup.out
 
 # Generated docs
 repomix-output.xml
+
+# Runtime artifacts
+rq_worker.pid

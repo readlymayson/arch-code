@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,8 @@ def _update_job_meta(**updates):
 
     Вызывается из execute_coding_task_sync для отправки прогресса
     в Redis, который будет прочитан get_task_status() в ai-core.
+    Также отправляет heartbeat для Watchdog (ai-core), чтобы тот
+    не убивал живую задачу по таймауту heartbeat.
     """
     try:
         from rq.job import get_current_job
@@ -55,8 +58,38 @@ def _update_job_meta(**updates):
         meta["_updated_at"] = __import__("time").time()
         job.meta = meta
         job.save_meta()
+        _send_watchdog_heartbeat(job.id)
     except Exception:
         logger.warning("Job meta update failed", exc_info=True)
+
+
+_HEARTBEAT_PREFIX = "watchdog:heartbeat:"
+_last_heartbeat_ts: float = 0.0
+
+
+def _send_watchdog_heartbeat(task_id: str, *, interval: float = 15.0) -> None:
+    """Отправить heartbeat в Redis для Watchdog (ai-core).
+
+    Watchdog убивает задачи, у которых нет свежего heartbeat дольше
+    HEARTBEAT_TIMEOUT (120 сек). Без heartbeat живая задача на шаге
+    explore/execute (когда LLM отвечает дольше 2 минут) будет убита.
+
+    Heartbeat отправляется не чаще чем раз в `interval` секунд.
+    """
+    global _last_heartbeat_ts
+    now = __import__("time").time()
+    if now - _last_heartbeat_ts < interval:
+        return  # throttle
+    _last_heartbeat_ts = now
+    try:
+        from redis import Redis
+        r = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        key = f"{_HEARTBEAT_PREFIX}{task_id}"
+        # TTL = 240с (2 * HEARTBEAT_TIMEOUT) — если воркер умер, ключ истекёт
+        r.setex(key, 240, str(now))
+        r.close()
+    except Exception:
+        logger.debug("Watchdog heartbeat send failed", exc_info=True)
 
 
 # ── Константы ────────────────────────────────────────────────────
@@ -334,6 +367,22 @@ def execute_coding_task_sync(
 
         _update_job_meta(current_step="explore", progress=10, iteration=1)
 
+        # ── Фоновый heartbeat-тред ─────────────────────────────
+        # Пока coding_graph.invoke() работает (LLM отвечает долго),
+        # шлём heartbeat в Redis каждые 15 сек, чтобы Watchdog в ai-core
+        # не убил живую задачу по таймауту heartbeat (120 сек).
+        _hb_stop = threading.Event()
+
+        def _heartbeat_loop():
+            while not _hb_stop.is_set():
+                _send_watchdog_heartbeat(actual_task_id, interval=10.0)
+                _hb_stop.wait(10)
+
+        _hb_thread = threading.Thread(
+            target=_heartbeat_loop, daemon=True, name=f"hb-{actual_task_id}"
+        )
+        _hb_thread.start()
+
         try:
             final_state = coding_graph.invoke(initial_state)
         except Exception as exc:
@@ -342,6 +391,10 @@ def execute_coding_task_sync(
                 actual_task_id,
                 error=f"Критический сбой графа: {exc}",
             )
+        finally:
+            _hb_stop.set()
+            if _hb_thread.is_alive():
+                _hb_thread.join(timeout=2)
 
         # Обновляем прогресс после графа
         iterations = final_state.get("iterations", 0)
