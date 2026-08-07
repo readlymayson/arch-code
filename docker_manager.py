@@ -293,6 +293,11 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
+                # Запускаем от UID/GID хост-пользователя (1000 = dev), чтобы
+                # создаваемые в sandbox файлы (__pycache__/*.pyc) принадлежали
+                # dev, а не root. Иначе ai-core (dev) не сможет удалить
+                # sandbox после исполнения → Permission denied.
+                user="1000:1000",
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -333,6 +338,9 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
+                # UID/GID хост-пользователя (1000 = dev): файлы node_modules
+                # создаются от dev, а не root (иначе sandbox не удалить).
+                user="1000:1000",
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -352,6 +360,7 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
+                user="1000:1000",
                 remove=False,
                 detach=False,
                 stderr=True,

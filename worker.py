@@ -7,6 +7,8 @@ Docker тестирует весь проект, на выходе — спис�
 Используется:
   - RQ-воркером для фоновой обработки
   - напрямую из main.py и chat.py
+  - из ai-core (OrderExecutor._run_arch_code) через asyncio.to_thread,
+    т.е. в НЕ главном потоке — регистрация signal.signal там невозможна
 """
 
 import asyncio
@@ -28,16 +30,40 @@ from tools.file_tools import RSYNC_EXCLUDE_PATTERNS
 _shutdown_requested = False
 
 
+def _register_sigterm_handler() -> None:
+    """Зарегистрировать обработчик SIGTERM (graceful shutdown).
+
+    signal.signal() можно вызывать ТОЛЬКО в главном потоке интерпретатора.
+    При вызове из asyncio.to_thread (ai-core OrderExecutor) поток не главный,
+    и signal.signal() бросит ValueError — это не критично: при недоступном
+    обработчике просто полагаемся на дефолтное поведение (SIGTERM → выход).
+    """
+    try:
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+        else:
+            logger.debug(
+                "SIGTERM handler пропущен: вызов не из главного потока"
+            )
+    except (ValueError, TypeError):
+        logger.debug("SIGTERM handler пропущен: сигналы недоступны в этом потоке")
+
+
 def _handle_sigterm(signum, frame):
     """Обработчик SIGTERM — устанавливает флаг для graceful shutdown.
 
     RQ посылает SIGTERM при stop-job, даёт ~1-2 секунды до SIGKILL.
     Флаг проверяется в try/finally, finally успевает выполниться.
+
+    Вызывается только из главного потока (см. _register_sigterm_handler).
     """
     global _shutdown_requested
     _shutdown_requested = True
     # Восстанавливаем дефолтный обработчик — повторный SIGTERM/SIGKILL
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    except (ValueError, TypeError):
+        pass
 
 
 # ── Job meta helper ──────────────────────────────────────────────
@@ -281,10 +307,12 @@ def execute_coding_task_sync(
 
     # ═══════════════════════════════════════════════════════════
     # 0. Регистрируем обработчик SIGTERM (graceful shutdown)
+    #    Только в главном потоке — при вызове из ai-core (asyncio.to_thread)
+    #    поток не главный, signal.signal() там запрещён (ValueError).
     # ═══════════════════════════════════════════════════════════
     global _shutdown_requested
     _shutdown_requested = False
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    _register_sigterm_handler()
 
     # ═══════════════════════════════════════════════════════════
     # 1. Инициализация
