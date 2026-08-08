@@ -157,6 +157,11 @@ def read_file(sandbox_dir: str, filepath: str, max_length: int = 50_000) -> str:
 
 # ── WriteFileTool ────────────────────────────────────────────────
 
+# Максимальный размер файла для write_file (защита от runaway LLM,
+# заполняющего диск). 500 КБ текста — достаточно для любых реальных файлов.
+MAX_WRITE_FILE_SIZE = 500_000
+
+
 def write_file(sandbox_dir: str, filepath: str, content: str) -> str:
     """Записать содержимое в файл внутри sandbox (создаёт папки при необходимости).
 
@@ -168,6 +173,13 @@ def write_file(sandbox_dir: str, filepath: str, content: str) -> str:
     Returns:
         Сообщение о результате.
     """
+    # Лимит размера — защита от runaway LLM
+    if len(content) > MAX_WRITE_FILE_SIZE:
+        return (
+            f"❌ Файл слишком большой (max {MAX_WRITE_FILE_SIZE} символов, "
+            f"получено {len(content)}). Разбей на части или упрости."
+        )
+
     full_path = _resolve_path(sandbox_dir, filepath)
     if full_path is None:
         return f"❌ Ошибка: путь '{filepath}' вне песочницы."

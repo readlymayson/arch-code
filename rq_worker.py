@@ -80,12 +80,12 @@ def _force_cleanup_task(task_id: str) -> None:
 
     try:
         cleanup_containers(task_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"Force cleanup containers for {task_id}: {exc}")
     try:
         NodeSandbox(task_id).cleanup()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"Force cleanup sandbox for {task_id}: {exc}")
 
 
 def _cleanup_orphaned_jobs(redis_conn) -> None:
@@ -114,8 +114,8 @@ def _cleanup_orphaned_jobs(redis_conn) -> None:
                         meta["cleanup_completed"] = True
                         job.meta = meta
                         job.save_meta()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(f"Orphan cleanup: не удалось обработать задачу {job_id}: {exc}")
         except Exception as exc:
             logger.warning(f"Orphan scan for {registry_key}: {exc}")
 
@@ -127,21 +127,26 @@ def start_worker() -> int:
     # ── Глобальный перехватчик необработанных исключений ────
     def _global_exception_hook(exc_type, exc_value, exc_tb):
         import traceback
-        logger.critical(
-            "Необработанное исключение в воркере:\n"
-            + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        )
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        logger.critical(f"Необработанное исключение в воркере:\n{tb_text}")
+        # Алерт об ошибке (webhook), если настроен
+        try:
+            from tools.error_alerter import send_error_alert
+
+            send_error_alert(task_id="worker-crash", error=tb_text[:1500])
+        except Exception as alert_exc:
+            logger.debug(f"Алерт о краше воркера не отправлен: {alert_exc}")
         # Снимаем lock, если воркер падает с необработанным исключением.
         # Имена могут быть ещё не определены (исключение до инициализации lock) —
         # закрываем try/except.
         try:
             _lock_refresh_stop.set()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Lock refresh stop не доступен: {exc}")
         try:
             _release_worker_lock()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Release lock не доступен: {exc}")
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _global_exception_hook
@@ -197,8 +202,8 @@ def start_worker() -> int:
         while not _lock_refresh_stop.is_set():
             try:
                 redis_conn.expire(LOCK_KEY, LOCK_TTL)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Не удалось продлить TTL lock {LOCK_KEY}: {exc}")
             _lock_refresh_stop.wait(LOCK_TTL // 2)
 
     _lock_refresh_thread = threading.Thread(
@@ -243,8 +248,8 @@ def start_worker() -> int:
             old_pid = PID_FILE.read_text().strip()
             logger.warning(f"Найден старый PID-файл: PID={old_pid}, удаляю")
             PID_FILE.unlink()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Не удалось удалить старый PID-файл: {exc}")
     try:
         PID_FILE.write_text(str(os.getpid()))
         logger.info(f"PID {os.getpid()} записан в {PID_FILE}")
@@ -260,15 +265,15 @@ def start_worker() -> int:
             worker_key = f"rq:worker:{worker_name}"
             redis_conn.delete(worker_key)
             logger.info(f"Ключ воркера {worker_key} очищен")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Не удалось очистить ключ воркера: {exc}")
         _lock_refresh_stop.set()
         _release_worker_lock()
         try:
             if PID_FILE.exists():
                 PID_FILE.unlink()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Не удалось удалить PID-файл при shutdown: {exc}")
         sys.exit(0)
 
     _signal.signal(_signal.SIGTERM, _shutdown_handler)

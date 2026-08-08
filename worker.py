@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from graph_worker import coding_graph
+from tools.error_alerter import send_error_alert
 from tools.file_tools import RSYNC_EXCLUDE_PATTERNS
 
 
@@ -238,8 +239,10 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
                 try:
                     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        f"compute_sandbox_diff: не удалось прочитать {filename}: {exc}"
+                    )
 
             diff_text = diff_result.stdout[:5000] if diff_result.stdout else ""
             if not diff_text and status == "added" and content is not None:
@@ -270,12 +273,24 @@ def _make_result(
     task_id: str,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Единый формат результата для очереди."""
-    return {
+    """Единый формат результата для очереди.
+
+    Для статусов "error" и "failed" отправляет алерт об ошибке
+    (tools/error_alerter.send_error_alert), если webhook настроен.
+    Алертинг graceful: сбой отправки не влияет на результат.
+    """
+    result = {
         "status": status,        # "success" | "failed" | "error"
         "task_id": task_id,
         **kwargs,
     }
+    if status in ("error", "failed"):
+        try:
+            err = kwargs.get("error") or kwargs.get("error_traceback") or ""
+            send_error_alert(task_id=task_id, error=err)
+        except Exception as alert_exc:
+            logger.warning(f"Алерт об ошибке задачи {task_id} не отправлен: {alert_exc}")
+    return result
 
 
 # ── Синхронная версия (ядро) ─────────────────────────────────────
@@ -285,6 +300,7 @@ def execute_coding_task_sync(
     task_id: Optional[str] = None,
     test_code: Optional[str] = None,
     project_dir: Optional[str] = None,
+    skip_smoke_test: bool = False,
 ) -> Dict[str, Any]:
     """Атомарный запуск цикла генерации кода (синхронная версия).
 
@@ -293,6 +309,8 @@ def execute_coding_task_sync(
         task_id: Уникальный ID (если не задан — генерируется).
         test_code: Опциональный тестовый скрипт (node:test).
         project_dir: Путь к проекту для копирования в sandbox.
+        skip_smoke_test: True → пропустить smoke-проверку приложения
+            (для микро-задач без точки входа main.py — экономия 15-20 сек).
 
     Returns:
         Dict с ключами:
@@ -409,6 +427,11 @@ def execute_coding_task_sync(
             "iterations": 0,
             "success": False,
             "changed_files": [],
+            # Run Verifier
+            "app_type": "",
+            "skip_smoke_test": skip_smoke_test,
+            "health_endpoint": "/health",
+            "health_port": 8000,
             "thought_steps": [],
             "action_steps": [],
             "chain_of_thought": "",
@@ -484,8 +507,8 @@ def execute_coding_task_sync(
                 if "__pycache__" in _dirs:
                     _shutil.rmtree(os.path.join(_root, "__pycache__"), ignore_errors=True)
                     _dirs[:] = [d for d in _dirs if d != "__pycache__"]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Ошибка очистки __pycache__ в sandbox: {exc}")
 
         # ── Валидация синтаксиса изменённых Python-файлов ────────────
         validation_errors = []
@@ -552,6 +575,14 @@ def execute_coding_task_sync(
                 "Превышено максимальное число итераций (3) без успеха.",
             )
             err_tb = final_state.get("error_traceback", "")
+
+            # Алерт об ошибке задачи (если настроен ERROR_WEBHOOK_URL)
+            try:
+                from tools.error_alerter import send_error_alert
+                send_error_alert(actual_task_id, err_msg)
+            except Exception as alert_exc:
+                logger.warning(f"Алерт не отправлен для {actual_task_id}: {alert_exc}")
+
             _update_job_meta(
                 error=err_msg,
                 error_traceback=err_tb,
@@ -641,6 +672,7 @@ async def execute_coding_task(
     task_description: str,
     task_id: Optional[str] = None,
     test_code: Optional[str] = None,
+    skip_smoke_test: bool = False,
 ) -> Dict[str, Any]:
     """async-версия — запускает синхронную функцию в thread pool."""
     return await asyncio.to_thread(
@@ -648,4 +680,5 @@ async def execute_coding_task(
         task_description=task_description,
         task_id=task_id,
         test_code=test_code,
+        skip_smoke_test=skip_smoke_test,
     )

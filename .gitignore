@@ -18,11 +18,15 @@ node_modules/
 sandbox/
 !sandbox/.gitkeep
 
+# Сгенерированные деливераблы worker'а (zip + распакованные папки)
+deliverables/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.orig
 
 # OS
 .DS_Store
@@ -37,6 +41,7 @@ logs/
 # Coverage
 .coverage
 .coverage.*
+htmlcov/
 
 # Runtime
 nohup.out

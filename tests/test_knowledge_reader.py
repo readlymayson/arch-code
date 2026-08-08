@@ -97,3 +97,72 @@ class TestReadKnowledgeTool:
         # Если файл не найден — проверяем сообщение об ошибке
         # Если найден — это тоже ок (зависит от структуры проекта)
         assert isinstance(result, str)
+
+
+class TestProjectTypeFiltering:
+    """Фильтрация по типу проекта (Python → python-* файлы)."""
+
+    def test_detect_project_type_python(self, tmp_path, monkeypatch):
+        """detect_project_type — requirements.txt → python."""
+        from tools.knowledge_reader import detect_project_type
+        project_dir = tmp_path / "pyproj"
+        project_dir.mkdir()
+        (project_dir / "requirements.txt").write_text("fastapi\n")
+        assert detect_project_type(str(project_dir)) == "python"
+
+    def test_detect_project_type_node(self, tmp_path):
+        """detect_project_type — package.json → node."""
+        from tools.knowledge_reader import detect_project_type
+        project_dir = tmp_path / "nodeproj"
+        project_dir.mkdir()
+        (project_dir / "package.json").write_text("{}")
+        assert detect_project_type(str(project_dir)) == "node"
+
+    def test_detect_project_type_unknown(self, tmp_path):
+        """detect_project_type — без маркеров → unknown."""
+        from tools.knowledge_reader import detect_project_type
+        assert detect_project_type(str(tmp_path)) == "unknown"
+
+    def test_python_resolves_to_python_file(self, tmp_path, monkeypatch):
+        """python-проект: style-guide.md → python-style-guide.md."""
+        # Создаём python-проект с knowledge/
+        knowledge_dir = tmp_path / "knowledge"
+        knowledge_dir.mkdir(parents=True, exist_ok=True)
+        (knowledge_dir / "python-style-guide.md").write_text("# Python Style Guide\nPy content\n")
+        (knowledge_dir / "style-guide.md").write_text("# Node Style Guide\n")
+        (tmp_path / "requirements.txt").write_text("fastapi\n")
+        monkeypatch.chdir(tmp_path)
+
+        from tools.knowledge_reader import ReadKnowledgeTool
+        result = ReadKnowledgeTool()._run("style-guide.md", project_type="python")
+        assert "Python Style Guide" in result
+        assert "Py content" in result
+
+    def test_node_keeps_generic_file(self, tmp_path, monkeypatch):
+        """node-проект: style-guide.md → остаётся generic (node-файл)."""
+        knowledge_dir = tmp_path / "knowledge"
+        knowledge_dir.mkdir(parents=True, exist_ok=True)
+        (knowledge_dir / "style-guide.md").write_text("# Node Style Guide\nNode content\n")
+        (tmp_path / "package.json").write_text("{}")
+        monkeypatch.chdir(tmp_path)
+
+        from tools.knowledge_reader import ReadKnowledgeTool
+        result = ReadKnowledgeTool()._run("style-guide.md", project_type="node")
+        assert "Node Style Guide" in result
+        assert "Node content" in result
+
+    def test_fallback_when_python_file_missing(self, tmp_path, monkeypatch):
+        """python-проект без python-варианта — fallback на generic-имя."""
+        knowledge_dir = tmp_path / "knowledge"
+        knowledge_dir.mkdir(parents=True, exist_ok=True)
+        (knowledge_dir / "style-guide.md").write_text("# Node Style Guide\n")
+        (tmp_path / "requirements.txt").write_text("fastapi\n")
+        monkeypatch.chdir(tmp_path)
+        # Изолируем от реального репозитория: только tmp_path/knowledge
+        monkeypatch.setattr(
+            "tools.knowledge_reader.KNOWLEDGE_ROOT", str(knowledge_dir)
+        )
+
+        from tools.knowledge_reader import ReadKnowledgeTool
+        result = ReadKnowledgeTool()._run("style-guide.md", project_type="python")
+        assert "Node Style Guide" in result

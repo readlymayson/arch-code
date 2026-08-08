@@ -214,13 +214,21 @@ class TestRunPythonTests:
         # Мокаем docker.from_env
         mocker.patch("docker.from_env", return_value=mock_client)
 
-        # Один объединённый запуск (pip install + pytest в одном sh -c)
-        mock_client.containers.run.return_value = b"collected 5 items ... 5 passed"
+        # Два вызова: pip install (сеть) → pytest (без сети)
+        mock_client.containers.run.side_effect = [
+            b"",  # pip install
+            b"collected 5 items ... 5 passed",  # pytest
+        ]
         mock_client.containers.get.side_effect = __import__("docker").errors.NotFound("not found")
 
         result = ProjectSandbox._run_python_tests(str(tmp_path), "task-123")
 
         assert result["status"] == "success"
+        # Проверяем, что фаза исполнения (2-й вызов) имеет network_mode="none"
+        second_call = mock_client.containers.run.call_args_list[1]
+        assert second_call.kwargs.get("network_mode") == "none"
+        assert "cap_drop" in second_call.kwargs
+        assert second_call.kwargs["cap_drop"] == ["ALL"]
 
     def test_failed(self, mocker, tmp_path):
         """Pytest с FAILED тестами."""
@@ -228,8 +236,11 @@ class TestRunPythonTests:
 
         mock_client = mocker.MagicMock()
         mocker.patch("docker.from_env", return_value=mock_client)
-        # Один объединённый запуск, вывод содержит FAILED
-        mock_client.containers.run.return_value = b"FAILED test_app.py::test_foo - AssertionError"
+        # Два вызова: install → pytest с FAILED
+        mock_client.containers.run.side_effect = [
+            b"",
+            b"FAILED test_app.py::test_foo - AssertionError",
+        ]
         mock_client.containers.get.side_effect = docker.errors.NotFound("not found")
 
         result = ProjectSandbox._run_python_tests(str(tmp_path), "task-456")
@@ -260,6 +271,11 @@ class TestRunNodeTests:
         result = ProjectSandbox._run_node_tests(str(tmp_path), "task-789")
 
         assert result["status"] == "success"
+        # Фаза исполнения (2-й вызов) — сетевая изоляция
+        second_call = mock_client.containers.run.call_args_list[1]
+        assert second_call.kwargs.get("network_mode") == "none"
+        assert second_call.kwargs["cap_drop"] == ["ALL"]
+        assert second_call.kwargs["user"] == "1000:1000"
 
     def test_npm_install_error(self, mocker, tmp_path):
         """Ошибка npm install."""
@@ -275,6 +291,7 @@ class TestRunNodeTests:
                 command=["npm", "install"],
                 image="node:alpine",
             ),
+            b"",
         ]
         mock_client.containers.get.side_effect = docker.errors.NotFound("not found")
 

@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
+from loguru import logger
 
 from docker_manager import ProjectSandbox
 from tools.file_tools import list_files, make_coding_tools
@@ -39,11 +40,14 @@ def _get_llm() -> ChatOpenAI:
 
 
 def _invoke_llm(llm, messages, *, timeout: float = 120.0):
-    """Вызвать LLM с жёстким таймаутом.
+    """Вызвать LLM с ретраями на таймауты и пустые ответы.
 
-    RouterAI иногда отвечает медленно (несколько минут). Без таймаута
-    задача висит на шаге explore, пока RQ не убьёт её по job_timeout
-    (600 сек), — и пользователь видит '❌ Ошибка за 0 сек на 10%'.
+    Исторический контекст: раньше таймаут реализовывался через
+    ThreadPoolExecutor + future.cancel(). Это не работало: cancel() не
+    может остановить уже запущенный поток, поэтому при таймауте LLM-вызов
+    продолжал работать в фоне — двойной биллинг и stale-ответы.
+    Теперь полагаемся на нативный timeout= у ChatOpenAI (httpx), а
+    tenacity ретраит именно исключения таймаута httpx.
 
     Args:
         llm: Экземпляр ChatOpenAI (или bind_tools()).
@@ -54,20 +58,47 @@ def _invoke_llm(llm, messages, *, timeout: float = 120.0):
         Ответ LLM (AIMessage / ChatResult).
 
     Raises:
-        TimeoutError: Если LLM не ответил за timeout секунд.
+        TimeoutError: Если LLM не ответил за timeout секунд
+            (после всех ретраев).
     """
-    import concurrent.futures as _cf
+    import httpx
+    from tenacity import (
+        retry,
+        retry_if_exception_type,
+        stop_after_attempt,
+        wait_exponential,
+    )
 
-    with _cf.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(llm.invoke, messages)
-        try:
-            return future.result(timeout=timeout)
-        except _cf.TimeoutError:
-            future.cancel()
-            raise TimeoutError(
-                f"LLM не ответил за {timeout}с "
-                f"(RouterAI/DeepSeek V4 Flash) — таймаут"
-            )
+    # Перехватываем только таймауты httpx + пустой ответ (ValueError).
+    # Логические/валидационные ошибки не ретраим — они не исчезнут
+    # от повторного вызова.
+    _RETRYABLE = (httpx.TimeoutException, httpx.ReadTimeout, ValueError)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(_RETRYABLE),
+        reraise=True,
+    )
+    def _call():
+        response = llm.invoke(messages)
+        # Пустой ответ — не таймаут, но тоже невалидный результат:
+        # пробрасываем как ошибку, чтобы ретрай сработал.
+        # ВАЖНО: ответ с tool_calls валиден даже при пустом content —
+        # модель решила вызвать инструмент, а не ответить текстом.
+        content = getattr(response, "content", None)
+        has_tool_calls = bool(getattr(response, "tool_calls", None))
+        if not has_tool_calls and (content is None or not str(content).strip()):
+            raise ValueError("Empty LLM response")
+        return response
+
+    try:
+        return _call()
+    except (httpx.TimeoutException, ValueError) as exc:
+        raise TimeoutError(
+            f"LLM не ответил за {timeout}с "
+            f"(RouterAI/DeepSeek V4 Flash) — таймаут"
+        ) from exc
 
 
 # ── Фильтр cp1251-несовместимых символов ─────────────────────────
@@ -91,6 +122,11 @@ class AgentState(TypedDict):
     iterations: int       # счётчик попыток
     success: bool         # финальный успех
     changed_files: list   # список изменённых файлов
+    # ── Run Verifier (smoke-проверка приложения) ──────────────
+    app_type: str         # "web_app" | "cli_script" | "skipped"
+    skip_smoke_test: bool # True → пропустить run_app (микро-задачи)
+    health_endpoint: str  # путь health-check для web_app
+    health_port: int      # порт health-check для web_app
     # ── Подробности для панели мониторинга ───────────────────
     thought_steps: list   # структурированные мысли агента
     action_steps: list    # структурированные действия
@@ -123,8 +159,8 @@ def _sum_tokens(response: object) -> dict:
                 "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                 "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Не удалось извлечь токены из ответа LLM: {exc}")
     return {"prompt_tokens": 0, "completion_tokens": 0}
 
 
@@ -425,6 +461,155 @@ def run_tests(state: AgentState):
         }
 
 
+# ── Узел: запуск приложения (smoke-проверка) ────────────────────
+
+# Ключевые слова, указывающие на веб-приложение (а не CLI-скрипт)
+_WEB_FRAMEWORK_KEYWORDS = (
+    "fastapi", "flask", "uvicorn", "aiohttp", "starlette",
+    "django", "express", "koa", "fastify", "hapijs",
+)
+
+
+def detect_app_type(sandbox_dir: str) -> str:
+    """Определить тип приложения: web_app или cli_script.
+
+    Читает main.py (или app.js) и ищет ключевые слова веб-фреймворков.
+    Если файл точки входа не найден или фреймворк не обнаружен —
+    считаем CLI-скриптом (консервативная эвристика).
+    """
+    entry_candidates = ["main.py", "app.py", "app.js", "server.js", "index.js"]
+    main_content = ""
+    for candidate in entry_candidates:
+        path = os.path.join(sandbox_dir, candidate)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    main_content = f.read()
+                break
+            except Exception as exc:
+                logger.debug(f"detect_app_type: не удалось прочитать {candidate}: {exc}")
+                continue
+
+    lowered = main_content.lower()
+    if any(kw in lowered for kw in _WEB_FRAMEWORK_KEYWORDS):
+        return "web_app"
+    return "cli_script"
+
+
+def run_application(state: AgentState):
+    """Запустить приложение в Docker и проверить, что оно работает.
+
+    Двухфазный запуск (см. ProjectSandbox.run_application):
+      1. install — зависимости с сетью
+      2. run — приложение без сети (network_mode="none")
+
+    Тип приложения определяется эвристикой detect_app_type():
+      - web_app:   запуск сервера + HTTP-запрос к health-эндпоинту
+      - cli_script: запуск с таймаутом + проверка exit code / Traceback
+
+    При падении полный traceback записывается в state["error"], чтобы
+    узел execute_actions на следующей итерации увидел точную причину.
+    """
+    sandbox_dir = state["sandbox_dir"]
+    ts = _now_iso()
+    action_steps = state.get("action_steps", [])
+
+    # Флаг skip_smoke_test — микро-задачи без точки входа пропускают smoke
+    if state.get("skip_smoke_test"):
+        action_steps.append({
+            "node": "run_app",
+            "action": "⏭️ Smoke-тест пропущен (skip_smoke_test=True)",
+            "status": "completed",
+            "timestamp": ts,
+        })
+        return {
+            "success": True,
+            "error": "",
+            "app_type": "skipped",
+            "action_steps": action_steps,
+        }
+
+    # Определяем тип проекта (python / node)
+    has_requirements = os.path.exists(os.path.join(sandbox_dir, "requirements.txt"))
+    has_package_json = os.path.exists(os.path.join(sandbox_dir, "package.json"))
+    has_pyproject = os.path.exists(os.path.join(sandbox_dir, "pyproject.toml"))
+    has_setup_py = os.path.exists(os.path.join(sandbox_dir, "setup.py"))
+
+    if has_requirements or has_pyproject or has_setup_py:
+        project_type = "python"
+    elif has_package_json:
+        project_type = "node"
+    else:
+        project_type = "unknown"
+
+    app_type = detect_app_type(sandbox_dir)
+    state_app_type = app_type
+
+    action_steps.append({
+        "node": "run_app",
+        "action": f"Тип проекта: {project_type}, приложение: {app_type}. "
+                  f"Запуск smoke-проверки...",
+        "status": "running",
+        "timestamp": ts,
+    })
+
+    health_endpoint = state.get("health_endpoint", "/health")
+    health_port = state.get("health_port", 8000)
+
+    try:
+        result = ProjectSandbox.run_application(
+            sandbox_dir=sandbox_dir,
+            project_type=project_type,
+            app_type=app_type,
+            task_id=state["task_id"],
+            health_endpoint=health_endpoint,
+            health_port=health_port,
+        )
+    except Exception as e:
+        action_steps.append({
+            "node": "run_app",
+            "action": f"❌ Ошибка Docker при запуске: {e}",
+            "status": "failed",
+            "timestamp": _now_iso(),
+        })
+        return {
+            "success": False,
+            "error": f"Ошибка Docker при запуске приложения: {e}",
+            "app_type": state_app_type,
+            "action_steps": action_steps,
+        }
+
+    if result["status"] == "success":
+        action_steps.append({
+            "node": "run_app",
+            "action": f"✅ Приложение работает ({app_type})",
+            "status": "completed",
+            "timestamp": _now_iso(),
+        })
+        return {
+            "success": True,
+            "error": "",
+            "app_type": state_app_type,
+            "action_steps": action_steps,
+        }
+    else:
+        # Пробрасываем полный traceback/stderr в state["error"], чтобы
+        # execute_actions на следующей итерации увидел точную причину.
+        err_output = result.get("output", "")[:2000]
+        action_steps.append({
+            "node": "run_app",
+            "action": f"❌ Приложение не работает: {err_output[:300]}",
+            "status": "failed",
+            "timestamp": _now_iso(),
+        })
+        return {
+            "success": False,
+            "error": f"Приложение не запустилось:\n{err_output}",
+            "app_type": state_app_type,
+            "action_steps": action_steps,
+        }
+
+
 # ── Маршрутизация ────────────────────────────────────────────────
 
 def route_next_step(state: AgentState):
@@ -435,6 +620,19 @@ def route_next_step(state: AgentState):
     return "execute"
 
 
+def route_after_test(state: AgentState):
+    """Роутинг после узла test:
+    - если тесты не прошли → execute (исправление)
+    - если skip_smoke_test=True → END (экономия 15-20 сек)
+    - иначе → run_app (smoke-проверка запуска)
+    """
+    if not state.get("success"):
+        return "execute"
+    if state.get("skip_smoke_test"):
+        return END
+    return "run_app"
+
+
 # ── Сборка графа ─────────────────────────────────────────────────
 
 workflow = StateGraph(AgentState)
@@ -442,10 +640,12 @@ workflow = StateGraph(AgentState)
 workflow.add_node("explore", explore_project)
 workflow.add_node("execute", execute_actions)
 workflow.add_node("test", run_tests)
+workflow.add_node("run_app", run_application)
 
 workflow.set_entry_point("explore")
 workflow.add_edge("explore", "execute")
 workflow.add_edge("execute", "test")
-workflow.add_conditional_edges("test", route_next_step)
+workflow.add_conditional_edges("test", route_after_test)
+workflow.add_conditional_edges("run_app", route_next_step)
 
 coding_graph = workflow.compile()

@@ -272,6 +272,27 @@ class TestWriteFile:
         result = write_file(task_dir, "../../malicious.js", "evil code")
         assert "❌" in result or "вне песочницы" in result
 
+    def test_size_limit_enforced(self, temp_sandbox):
+        """Файл больше лимита — отклоняется."""
+        from tools.file_tools import MAX_WRITE_FILE_SIZE
+
+        task_dir = str(temp_sandbox / "test_task_001")
+        oversized = "x" * (MAX_WRITE_FILE_SIZE + 1)
+        result = write_file(task_dir, "huge.js", oversized)
+        assert "❌" in result
+        assert "слишком большой" in result
+        # Файл НЕ должен быть создан
+        assert not os.path.exists(os.path.join(task_dir, "huge.js"))
+
+    def test_at_size_limit_allowed(self, temp_sandbox):
+        """Файл ровно на лимите — записывается."""
+        from tools.file_tools import MAX_WRITE_FILE_SIZE
+
+        task_dir = str(temp_sandbox / "test_task_001")
+        content = "x" * MAX_WRITE_FILE_SIZE
+        result = write_file(task_dir, "exact.js", content)
+        assert "✅" in result
+
 
 # ── make_coding_tools ──────────────────────────────────────────
 

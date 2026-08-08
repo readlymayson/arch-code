@@ -61,8 +61,8 @@ def generate_tests_for_task(
                 f for f in os.listdir(tests_dir)
                 if f.endswith(".py") and f != "__init__.py"
             ]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"TDD: не удалось прочитать tests/: {exc}")
 
     existing_context = ""
     if existing_tests:

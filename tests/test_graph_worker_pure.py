@@ -15,7 +15,12 @@
 11. ✅ route_next_step — граничное значение iterations=3
 12. ✅ _get_llm — singleton (повторный вызов возвращает тот же)
 13. ✅ _get_llm — с установленными env vars
-14. ✅ AgentState — все поля присутствуют
+14. ✅ _invoke_llm — успех с первого раза
+15. ✅ _invoke_llm — пустой ответ → ретрай → успех
+16. ✅ _invoke_llm — все пустые → TimeoutError после 3 попыток
+17. ✅ _invoke_llm — httpx.ReadTimeout → 3 ретрая → TimeoutError
+18. ✅ _invoke_llm — логическая ошибка не ретраится
+19. ✅ AgentState — все поля присутствуют
 """
 
 import os
@@ -130,6 +135,111 @@ class TestGetLLM:
         assert "routerai.test.ru" in str(llm._default_params.get("base_url", "")) or \
                "routerai.test.ru" in llm.__repr__() or \
                "routerai.test.ru" in repr(llm)
+
+
+# ── _invoke_llm ──────────────────────────────────────────────────
+
+class TestInvokeLLM:
+    """Retry-логика вокруг LLM-вызова."""
+
+    def test_success_first_try(self):
+        """Успешный ответ с первого раза — без ретраев."""
+        from graph_worker import _invoke_llm
+
+        class FakeResponse:
+            content = "ok"
+
+        class FakeLLM:
+            calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                return FakeResponse()
+
+        llm = FakeLLM()
+        result = _invoke_llm(llm, ["hello"])
+        assert result.content == "ok"
+        assert llm.calls == 1
+
+    def test_retry_on_empty_then_success(self):
+        """Пустой ответ → ретрай → успех."""
+        from graph_worker import _invoke_llm
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeLLM:
+            calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return FakeResponse("")
+                return FakeResponse("ok")
+
+        llm = FakeLLM()
+        result = _invoke_llm(llm, ["hello"])
+        assert result.content == "ok"
+        assert llm.calls == 2
+
+    def test_all_empty_raises_timeout(self):
+        """Все ответы пустые → TimeoutError после 3 попыток."""
+        import pytest as _pytest
+
+        from graph_worker import _invoke_llm
+
+        class FakeResponse:
+            content = ""
+
+        class FakeLLM:
+            calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                return FakeResponse()
+
+        llm = FakeLLM()
+        with _pytest.raises(TimeoutError):
+            _invoke_llm(llm, ["hello"])
+        assert llm.calls == 3
+
+    def test_timeout_retries_then_raises(self):
+        """httpx.ReadTimeout → ретраи 3 раза → TimeoutError."""
+        import httpx as _httpx
+        import pytest as _pytest
+
+        from graph_worker import _invoke_llm
+
+        class FakeLLM:
+            calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                raise _httpx.ReadTimeout("timeout", request=None)
+
+        llm = FakeLLM()
+        with _pytest.raises(TimeoutError):
+            _invoke_llm(llm, ["hello"])
+        assert llm.calls == 3
+
+    def test_non_retryable_error_propagates(self):
+        """Логическая ошибка (не таймаут) — не ретраится, пробрасывается."""
+        import pytest as _pytest
+
+        from graph_worker import _invoke_llm
+
+        class FakeLLM:
+            calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                raise RuntimeError("logic error")
+
+        llm = FakeLLM()
+        with _pytest.raises(RuntimeError):
+            _invoke_llm(llm, ["hello"])
+        assert llm.calls == 1
 
 
 # ── AgentState ───────────────────────────────────────────────────

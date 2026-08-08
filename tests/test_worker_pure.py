@@ -38,6 +38,33 @@ class TestMakeResult:
         assert result["status"] == "error"
         assert result["error"] == "Something went wrong"
 
+    def test_failure_triggers_alert(self, mocker):
+        """status='failed' → отправляется алерт об ошибке."""
+        mock_alert = mocker.patch("worker.send_error_alert")
+        result = _make_result(
+            "failed", "task-fail", error="Тесты не прошли"
+        )
+        mock_alert.assert_called_once()
+        kwargs = mock_alert.call_args.kwargs
+        assert kwargs["task_id"] == "task-fail"
+        assert "Тесты не прошли" in kwargs["error"]
+
+    def test_success_no_alert(self, mocker):
+        """status='success' → алерт НЕ отправляется."""
+        mock_alert = mocker.patch("worker.send_error_alert")
+        _make_result("success", "task-ok")
+        mock_alert.assert_not_called()
+
+    def test_alert_failure_graceful(self, mocker):
+        """Сбой отправки алерта не ломает результат."""
+        mocker.patch(
+            "worker.send_error_alert",
+            side_effect=RuntimeError("webhook down"),
+        )
+        result = _make_result("error", "task-err", error="boom")
+        assert result["status"] == "error"
+        assert result["error"] == "boom"
+
     def test_with_extra_fields(self):
         """Дополнительные kwargs."""
         result = _make_result(

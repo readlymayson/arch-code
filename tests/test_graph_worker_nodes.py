@@ -427,9 +427,175 @@ class TestCodingGraph:
             pytest.fail(f"Граф не скомпилировался: {e}")
 
     def test_graph_has_all_nodes(self):
-        """В графе есть все 3 узла + conditional edge."""
+        """В графе есть все 4 узла + conditional edge."""
         from graph_worker import workflow
 
         assert "explore" in workflow.nodes
         assert "execute" in workflow.nodes
         assert "test" in workflow.nodes
+        assert "run_app" in workflow.nodes
+
+
+# ── detect_app_type ─────────────────────────────────────────────
+
+class TestDetectAppType:
+    """Эвристика определения типа приложения (web_app / cli_script)."""
+
+    def test_fastapi_main_py(self, tmp_path):
+        """main.py с FastAPI → web_app."""
+        import graph_worker
+        (tmp_path / "main.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+        )
+        assert graph_worker.detect_app_type(str(tmp_path)) == "web_app"
+
+    def test_flask_app_py(self, tmp_path):
+        """app.py с Flask → web_app."""
+        import graph_worker
+        (tmp_path / "app.py").write_text(
+            'from flask import Flask\napp = Flask(__name__)\n'
+        )
+        assert graph_worker.detect_app_type(str(tmp_path)) == "web_app"
+
+    def test_uvicorn_main(self, tmp_path):
+        """main.py с uvicorn.run → web_app."""
+        import graph_worker
+        (tmp_path / "main.py").write_text(
+            'import uvicorn\nif __name__ == "__main__":\n'
+            '    uvicorn.run(app, host="0.0.0.0")\n'
+        )
+        assert graph_worker.detect_app_type(str(tmp_path)) == "web_app"
+
+    def test_cli_script(self, tmp_path):
+        """main.py без веб-фреймворков → cli_script."""
+        import graph_worker
+        (tmp_path / "main.py").write_text(
+            'import sys\ndef main():\n    print("hello")\n'
+        )
+        assert graph_worker.detect_app_type(str(tmp_path)) == "cli_script"
+
+    def test_no_entry_file(self, tmp_path):
+        """Нет файла точки входа → cli_script (консервативно)."""
+        import graph_worker
+        assert graph_worker.detect_app_type(str(tmp_path)) == "cli_script"
+
+
+# ── route_after_test ────────────────────────────────────────────
+
+class TestRouteAfterTest:
+    """Роутинг после test: execute / END / run_app."""
+
+    def test_failed_tests_go_execute(self):
+        """Тесты не прошли → execute."""
+        from graph_worker import route_after_test
+        state = {"success": False, "skip_smoke_test": False}
+        assert route_after_test(state) == "execute"
+
+    def test_skip_smoke_goes_end(self):
+        """skip_smoke_test=True + успех → END."""
+        from graph_worker import route_after_test
+        state = {"success": True, "skip_smoke_test": True}
+        assert route_after_test(state) == "__end__"
+
+    def test_success_goes_run_app(self):
+        """Тесты прошли, smoke не пропущен → run_app."""
+        from graph_worker import route_after_test
+        state = {"success": True, "skip_smoke_test": False}
+        assert route_after_test(state) == "run_app"
+
+
+# ── run_application ─────────────────────────────────────────────
+
+class TestRunApplication:
+    """Узел smoke-проверки приложения."""
+
+    @pytest.fixture
+    def base_state(self, tmp_path):
+        return {
+            "sandbox_dir": str(tmp_path / "sandbox_run"),
+            "task_id": "run-app-test",
+            "success": False,
+            "error": "",
+            "iterations": 1,
+            "action_steps": [],
+            "skip_smoke_test": False,
+            "health_endpoint": "/health",
+            "health_port": 8000,
+        }
+
+    def test_skip_smoke_test(self, base_state):
+        """skip_smoke_test=True → пропуск без вызова Docker."""
+        import graph_worker
+        base_state["skip_smoke_test"] = True
+        result = graph_worker.run_application(base_state)
+        assert result["success"] is True
+        assert result["app_type"] == "skipped"
+
+    def test_web_app_success(self, mocker, base_state, tmp_path):
+        """web_app → запуск + health-check OK."""
+        import graph_worker
+        os.makedirs(base_state["sandbox_dir"], exist_ok=True)
+        (tmp_path / "sandbox_run" / "main.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+        )
+
+        mocker.patch(
+            "graph_worker.ProjectSandbox.run_application",
+            return_value={"status": "success", "output": "OK"},
+        )
+
+        result = graph_worker.run_application(base_state)
+        assert result["success"] is True
+        assert result["app_type"] == "web_app"
+
+    def test_cli_script_success(self, mocker, base_state, tmp_path):
+        """cli_script → запуск CLI с exit code 0."""
+        import graph_worker
+        os.makedirs(base_state["sandbox_dir"], exist_ok=True)
+        (tmp_path / "sandbox_run" / "main.py").write_text(
+            'def main():\n    print("hello")\n'
+        )
+
+        mocker.patch(
+            "graph_worker.ProjectSandbox.run_application",
+            return_value={"status": "success", "output": "hello"},
+        )
+
+        result = graph_worker.run_application(base_state)
+        assert result["success"] is True
+        assert result["app_type"] == "cli_script"
+
+    def test_app_failure_passes_error(self, mocker, base_state, tmp_path):
+        """Приложение не стартует → error с traceback в state."""
+        import graph_worker
+        os.makedirs(base_state["sandbox_dir"], exist_ok=True)
+        (tmp_path / "sandbox_run" / "main.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+        )
+
+        mocker.patch(
+            "graph_worker.ProjectSandbox.run_application",
+            return_value={
+                "status": "error",
+                "output": "ModuleNotFoundError: No module named 'fastapi'",
+            },
+        )
+
+        result = graph_worker.run_application(base_state)
+        assert result["success"] is False
+        assert "ModuleNotFoundError" in result["error"]
+
+    def test_docker_exception(self, mocker, base_state, tmp_path):
+        """Docker Exception — graceful."""
+        import graph_worker
+        os.makedirs(base_state["sandbox_dir"], exist_ok=True)
+        (tmp_path / "sandbox_run" / "main.py").write_text("print('x')\n")
+
+        mocker.patch(
+            "graph_worker.ProjectSandbox.run_application",
+            side_effect=Exception("Docker daemon down"),
+        )
+
+        result = graph_worker.run_application(base_state)
+        assert result["success"] is False
+        assert "Docker" in result["error"]
