@@ -376,8 +376,19 @@ def execute_coding_task_sync(
             cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
         )
         subprocess.run(
-            ["git", "commit", "-m", "initial state before agent"],
+            ["git", "commit", "-m", "initial state before agent", "--allow-empty"],
             cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr_detail = exc.stderr.decode(errors="replace") if exc.stderr else "(нет stderr)"
+        stdout_detail = exc.stdout.decode(errors="replace") if exc.stdout else "(нет stdout)"
+        return _make_result(
+            "error",
+            actual_task_id,
+            error=(
+                f"git commit failed (exit code {exc.returncode}): "
+                f"stdout={stdout_detail}, stderr={stderr_detail}"
+            ),
         )
     except Exception as exc:
         return _make_result(

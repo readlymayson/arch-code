@@ -4,6 +4,10 @@ After=network.target redis-server.service
 Wants=redis-server.service
 BindsTo=redis-server.service
 
+# Защита от бесконечного цикла перезапусков
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=dev
