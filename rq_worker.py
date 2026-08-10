@@ -154,7 +154,7 @@ def start_worker() -> int:
     redis_url = get_redis_url()
     logger.info(f"=== Запуск фонового воркера кода (arch-code) ===")
     logger.info(f"Redis: {redis_url}")
-    logger.info(f"Очередь: coding_tasks")
+    logger.info(f"Очереди: high_priority (личные) → coding_tasks (клиенты)")
 
     try:
         redis_conn = Redis.from_url(redis_url, decode_responses=False)
@@ -195,16 +195,30 @@ def start_worker() -> int:
         except Exception as exc:
             logger.warning(f"Не удалось снять lock {LOCK_KEY}: {exc}")
 
-    # Фоновый тред продлевает TTL, пока воркер жив
+    # Фоновый тред продлевает TTL, пока воркер жив.
+    # ВАЖНО: используем ОТДЕЛЬНОЕ Redis-соединение (lock_redis), а не
+    # redis_conn воркера. RQ выполняет BLPop на redis_conn в основном
+    # потоке; любая команда из другого треда на том же соединении
+    # перебивает BLPop и вызывает redis.exceptions.TimeoutError →
+    # «Worker: Redis connection timeout, quitting...».
     _lock_refresh_stop = threading.Event()
 
     def _lock_refresh_loop():
-        while not _lock_refresh_stop.is_set():
+        # Своё соединение на тред (redis-py пул не потокобезопасен
+        # для параллельных команд на одном соединении)
+        lock_redis = Redis.from_url(redis_url, decode_responses=False)
+        try:
+            while not _lock_refresh_stop.is_set():
+                try:
+                    lock_redis.expire(LOCK_KEY, LOCK_TTL)
+                except Exception as exc:
+                    logger.warning(f"Не удалось продлить TTL lock {LOCK_KEY}: {exc}")
+                _lock_refresh_stop.wait(LOCK_TTL // 2)
+        finally:
             try:
-                redis_conn.expire(LOCK_KEY, LOCK_TTL)
-            except Exception as exc:
-                logger.warning(f"Не удалось продлить TTL lock {LOCK_KEY}: {exc}")
-            _lock_refresh_stop.wait(LOCK_TTL // 2)
+                lock_redis.close()
+            except Exception:
+                pass
 
     _lock_refresh_thread = threading.Thread(
         target=_lock_refresh_loop, daemon=True, name="worker-lock-refresh"
@@ -233,7 +247,14 @@ def start_worker() -> int:
     except Exception as exc:
         logger.warning(f"Не удалось очистить stale-ключи: {exc}")
 
-    queues = [Queue("coding_tasks", connection=redis_conn)]
+    # ── Очереди с приоритетом ─────────────────────────────────────
+    # RQ Worker обрабатывает очереди в порядке объявления:
+    # сначала все задачи из high_priority (личные), потом из coding_tasks
+    # (клиентские, Pay-As-You-Go). Один воркер, два канала.
+    queues = [
+        Queue("high_priority", connection=redis_conn),
+        Queue("coding_tasks", connection=redis_conn),
+    ]
 
     # ── Orphan cleanup: дочищаем ресурсы упавших задач ──────────
     try:
