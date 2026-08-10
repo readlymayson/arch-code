@@ -187,6 +187,16 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
     """
     timeout = 30
 
+    # Каталоги, которые НИКОГДА не должны попадать в changed_files:
+    # Docker-песочница пишет сюда pip-зависимости (pip --target=/app/.deps).
+    # Без фильтра 10+ тысяч файлов пакетов попадают в результат →
+    # build_zip держит их содержимое в памяти → OOM-kill воркера.
+    _EXCLUDED_DIFF_DIRS = {".deps", "node_modules", "__pycache__", ".venv", "venv"}
+
+    def _diff_is_excluded(rel_path: str) -> bool:
+        parts = rel_path.replace("\\", "/").split("/")
+        return any(p in _EXCLUDED_DIFF_DIRS for p in parts)
+
     try:
         # Добавляем и проверяем unfitted-файлы
         subprocess.run(
@@ -211,6 +221,10 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
             # После git add -A: X=A/M/D, Y=пусто
             x_status = line[0:1]  # первый символ — статус в staging
             filename = line[3:].strip()
+
+            # Пропускаем служебные каталоги (pip-зависимости и т.п.)
+            if _diff_is_excluded(filename):
+                continue
 
             if x_status == "A":
                 status = "added"

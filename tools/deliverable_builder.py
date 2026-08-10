@@ -19,7 +19,10 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 # Папки/файлы, которые исключаем из deliverable
-EXCLUDE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"}
+EXCLUDE_DIRS = {
+    ".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache",
+    ".deps", ".tox", ".mypy_cache", ".ruff_cache",
+}
 EXCLUDE_FILES = {".DS_Store", "*.pyc"}
 
 

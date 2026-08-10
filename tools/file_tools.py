@@ -33,6 +33,11 @@ RSYNC_EXCLUDE_PATTERNS = [
     ".gitignore",
     "docker-compose*.yml",
     "Dockerfile*",
+    # Docker-песочница ставит сюда pip-зависимости (pip --target=/app/.deps).
+    # Без исключения 10+ тысяч файлов пакетов попадают в changed_files →
+    # взрыв памяти при сборке deliverable → OOM-kill воркера.
+    ".deps",
+    "*.egg-info",
 ]
 
 
