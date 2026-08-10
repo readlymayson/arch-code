@@ -91,6 +91,49 @@ class TestBuildZip:
             assert not any(".git" in n for n in names)
             assert not any("__pycache__" in n for n in names)
 
+    def test_deps_excluded(self, tmp_path):
+        """Файлы из .deps (pip-зависимости) не попадают в архив.
+
+        Регрессия OOM-бага task_19f8a4b8: build_zip держал содержимое
+        тысяч .deps-файлов в памяти → OOM-kill. Фильтр в EXCLUDE_DIRS.
+        """
+        files = [
+            {
+                "path": "core/app.py",
+                "status": "added",
+                "content": "x = 1\n",
+                "diff": "...",
+            },
+            {
+                "path": ".deps/aiohttp/__init__.py",
+                "status": "added",
+                "content": "pkg",
+                "diff": "...",
+            },
+            {
+                "path": ".deps/setup.cfg",
+                "status": "added",
+                "content": "[metadata]",
+                "diff": "...",
+            },
+            {
+                "path": "sub/.deps/x.py",
+                "status": "added",
+                "content": "nested",
+                "diff": "...",
+            },
+        ]
+        zip_path = build_zip(
+            task_id="task_123",
+            changed_files=files,
+            output_dir=str(tmp_path),
+        )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            assert any(n.endswith("core/app.py") for n in names)
+            assert not any(".deps" in n for n in names), f".deps попал в архив: {names}"
+
     def test_empty_files_returns_none(self, tmp_path):
         """Пустой changed_files → None."""
         assert (

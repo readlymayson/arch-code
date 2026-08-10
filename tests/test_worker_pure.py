@@ -148,3 +148,58 @@ class TestComputeSandboxDiff:
         result = compute_sandbox_diff("/tmp/nonexistent_sandbox_xyz")
         # Должен вернуть пустой список или ошибку, но не упасть
         assert isinstance(result, list)
+
+    def test_deps_excluded(self, sandbox_with_git):
+        """Каталог .deps (pip-зависимости) не попадает в diff.
+
+        Регрессия OOM-бага: Docker-песочница ставит зависимости в
+        sandbox/.deps (pip install --target=/app/.deps). Если их включить
+        в changed_files, build_zip держит содержимое тысяч файлов в памяти
+        → OOM-kill воркера. Файлы .deps должны фильтроваться.
+        """
+        from worker import compute_sandbox_diff
+
+        # Реальный файл агента
+        new_file_path = os.path.join(sandbox_with_git, "real_change.py")
+        with open(new_file_path, "w") as f:
+            f.write("print('real change')\n")
+
+        # Мусор .deps (имитация pip install --target=/app/.deps)
+        deps_dir = os.path.join(sandbox_with_git, ".deps")
+        os.makedirs(os.path.join(deps_dir, "aiohttp"), exist_ok=True)
+        with open(os.path.join(deps_dir, "aiohttp", "__init__.py"), "w") as f:
+            f.write("pkg\n")
+        with open(os.path.join(deps_dir, "setup.cfg"), "w") as f:
+            f.write("[metadata]\n")
+        # Вложенный .deps в подкаталоге тоже должен исключаться
+        nested = os.path.join(sandbox_with_git, "sub", ".deps")
+        os.makedirs(nested, exist_ok=True)
+        with open(os.path.join(nested, "x.py"), "w") as f:
+            f.write("nested\n")
+
+        result = compute_sandbox_diff(sandbox_with_git)
+        paths = [f["path"] for f in result]
+
+        # Реальное изменение на месте
+        assert any("real_change.py" in p for p in paths)
+        # Ни одного .deps файла
+        assert not any(".deps" in p for p in paths), f".deps попал в diff: {paths}"
+        assert not any(p.startswith(".deps/") for p in paths)
+        assert not any(p.startswith("sub/.deps/") for p in paths)
+
+    def test_node_modules_and_pycache_excluded(self, sandbox_with_git):
+        """node_modules / __pycache__ тоже не попадают в diff."""
+        from worker import compute_sandbox_diff
+
+        # Мусор
+        for rel in ("node_modules/pkg/index.js", "pkg/__pycache__/mod.cpython-312.pyc"):
+            full = os.path.join(sandbox_with_git, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                f.write("x\n")
+
+        result = compute_sandbox_diff(sandbox_with_git)
+        paths = [f["path"] for f in result]
+
+        assert not any("node_modules" in p for p in paths)
+        assert not any("__pycache__" in p for p in paths)
