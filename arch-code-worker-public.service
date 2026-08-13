@@ -1,5 +1,5 @@
 [Unit]
-Description=Arch-Code Worker — RQ-воркер фоновых задач (coding_tasks)
+Description=Arch-Code Worker (Public) — RQ-воркер клиентских задач (coding_tasks, Redis db 1)
 After=network.target redis-server.service
 Wants=redis-server.service
 BindsTo=redis-server.service
@@ -15,16 +15,17 @@ Group=dev
 WorkingDirectory=/home/dev/projects/arch-code
 Environment=PYTHONPATH=/home/dev/projects/arch-code
 Environment=PATH=/home/dev/projects/arch-code/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# Личный инстанс AI Core: Redis DB 0 (high_priority + coding_tasks).
-# Публичный воркер (клиенты) — отдельный сервис arch-code-worker-public (db 1).
-Environment=REDIS_URL=redis://localhost:6379/0
-Environment=REDIS_DB=0
+# Публичный инстанс AI Core работает на Redis DB 1 (config.public.json).
+# Этот воркер выполняет ТОЛЬКО клиентские задачи из db 1 — полная изоляция
+# от личного инстанса (db 0, arch-code-worker.service).
+Environment=REDIS_URL=redis://localhost:6379/1
+Environment=REDIS_DB=1
 ExecStart=/home/dev/projects/arch-code/venv/bin/python /home/dev/projects/arch-code/rq_worker.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=arch-code-worker
+SyslogIdentifier=arch-code-worker-public
 
 # Безопасность
 NoNewPrivileges=yes

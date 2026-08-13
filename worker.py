@@ -104,6 +104,9 @@ def _send_watchdog_heartbeat(task_id: str, *, interval: float = 15.0) -> None:
     explore/execute (когда LLM отвечает дольше 2 минут) будет убита.
 
     Heartbeat отправляется не чаще чем раз в `interval` секунд.
+    Использует соединение ТЕКУЩЕГО job'а (get_current_job().connection),
+    чтобы heartbeat уходил в ту же Redis DB, из которой взят job —
+    это критично для изоляции инстансов (личный db 0 / публичный db 1).
     """
     global _last_heartbeat_ts
     now = __import__("time").time()
@@ -111,12 +114,26 @@ def _send_watchdog_heartbeat(task_id: str, *, interval: float = 15.0) -> None:
         return  # throttle
     _last_heartbeat_ts = now
     try:
+        from rq.job import get_current_job
         from redis import Redis
-        r = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+        conn = None
+        job = get_current_job()
+        if job is not None and job.connection is not None:
+            conn = job.connection
+        if conn is None:
+            # Fallback (прямой вызов вне RQ): env REDIS_URL (у воркера он
+            # указывает на правильную DB — db 0 личный / db 1 публичный).
+            conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+            _owns_conn = True
+        else:
+            _owns_conn = False
+
         key = f"{_HEARTBEAT_PREFIX}{task_id}"
         # TTL = 240с (2 * HEARTBEAT_TIMEOUT) — если воркер умер, ключ истекёт
-        r.setex(key, 240, str(now))
-        r.close()
+        conn.setex(key, 240, str(now))
+        if _owns_conn:
+            conn.close()
     except Exception:
         logger.debug("Watchdog heartbeat send failed", exc_info=True)
 
@@ -195,7 +212,14 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
 
     def _diff_is_excluded(rel_path: str) -> bool:
         parts = rel_path.replace("\\", "/").split("/")
-        return any(p in _EXCLUDED_DIFF_DIRS for p in parts)
+        if any(p in _EXCLUDED_DIFF_DIRS for p in parts):
+            return True
+        # Артефакты smoke-теста (временные скрипты health-check) не должны
+        # попадать в результат/ZIP — они создаются только для проверки.
+        basename = parts[-1] if parts else ""
+        if basename.startswith("_smoke_web."):
+            return True
+        return False
 
     try:
         # Добавляем и проверяем unfitted-файлы
@@ -457,6 +481,8 @@ def execute_coding_task_sync(
             "skip_smoke_test": skip_smoke_test,
             "health_endpoint": "/health",
             "health_port": 8000,
+            # Контекст проекта заполняется узлом explore (ProjectContextInspector)
+            "project_context": "",
             "thought_steps": [],
             "action_steps": [],
             "chain_of_thought": "",
@@ -652,12 +678,26 @@ def _publish_result_notification(task_id: str) -> None:
 
     ai-core подписан на канал "coding_tasks:results" и получит
     уведомление без polling.
+
+    Публикуем в соединение ТЕКУЩЕГО job'а, чтобы канал был в той же
+    Redis DB, что и очередь (изоляция инстансов: db 0 личный / db 1 публичный).
     """
     try:
+        from rq.job import get_current_job
         from redis import Redis
-        r = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-        r.publish("coding_tasks:results", task_id)
-        r.close()
+
+        conn = None
+        _owns_conn = False
+        job = get_current_job()
+        if job is not None and job.connection is not None:
+            conn = job.connection
+        if conn is None:
+            conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+            _owns_conn = True
+
+        conn.publish("coding_tasks:results", task_id)
+        if _owns_conn:
+            conn.close()
     except Exception:
         logger.warning(f"Redis pub/sub notification failed for {task_id}", exc_info=True)  # fallback polling в ai-core подхватит
 

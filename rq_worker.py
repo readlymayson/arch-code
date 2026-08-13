@@ -152,9 +152,19 @@ def start_worker() -> int:
     sys.excepthook = _global_exception_hook
 
     redis_url = get_redis_url()
+
+    # ── Изоляция инстансов (2026-08-11) ───────────────────────
+    # Личный инстанс AI Core: Redis DB 0 → слушаем high_priority + coding_tasks.
+    # Публичный инстанс (config.public.json): Redis DB 1 → ТОЛЬКО coding_tasks
+    # (клиентские, Pay-As-You-Go). Клиент не должен попасть в личную очередь.
+    redis_db = int(os.getenv("REDIS_DB", "0"))
+    is_public_worker = redis_db != 0
     logger.info(f"=== Запуск фонового воркера кода (arch-code) ===")
     logger.info(f"Redis: {redis_url}")
-    logger.info(f"Очереди: high_priority (личные) → coding_tasks (клиенты)")
+    if is_public_worker:
+        logger.info(f"Режим: PUBLIC (db {redis_db}) — очередь: coding_tasks (клиенты)")
+    else:
+        logger.info(f"Режим: PERSONAL (db {redis_db}) — очереди: high_priority (личные) → coding_tasks")
 
     try:
         redis_conn = Redis.from_url(redis_url, decode_responses=False)
@@ -166,13 +176,16 @@ def start_worker() -> int:
 
     import socket
     hostname = socket.gethostname()
-    worker_name = f"arch-code-worker-{hostname}-{os.getpid()}"
+    _db_suffix = f"-db{redis_db}" if is_public_worker else ""
+    worker_name = f"arch-code-worker{_db_suffix}-{hostname}-{os.getpid()}"
 
     # ── Redis SETNX lock: защита от дублирующихся воркеров ──────────
     # Атомарный setnx предотвращает запуск второго воркера при рестартах
     # systemd (когда старый процесс ещё не успел очистить rq:worker:* ключи).
     # TTL 30 секунд — если воркер жив дольше, lock обновляется в фоне.
-    LOCK_KEY = "worker:arch-code:lock"
+    # Суффикс db изолирует lock между личным (db 0) и публичным (db 1) воркерами
+    # (даже в одной DB разные воркеры одного типа не запустятся дважды).
+    LOCK_KEY = f"worker:arch-code:lock{_db_suffix}"
     LOCK_TTL = 30  # секунд
     acquired = redis_conn.set(LOCK_KEY, str(os.getpid()), nx=True, ex=LOCK_TTL)
     if not acquired:
@@ -229,13 +242,15 @@ def start_worker() -> int:
     # ── Очищаем stale-воркеров ─────────────────────────────────
     try:
         # Используем SCAN вместо KEYS для production-безопасности,
-        # ищем все stale ключи воркеров arch-code
+        # ищем все stale ключи воркеров arch-code (только для этой DB).
+        # scan() уже ограничен текущей DB, но для чистоты учитываем suffix.
+        stale_match = f"rq:worker:arch-code-worker{_db_suffix}*"
         stale_keys = []
         cursor = 0
         while True:
             cursor, batch = redis_conn.scan(
                 cursor=cursor,
-                match="rq:worker:arch-code-worker*",
+                match=stale_match,
                 count=100,
             )
             stale_keys.extend(batch)
@@ -248,13 +263,18 @@ def start_worker() -> int:
         logger.warning(f"Не удалось очистить stale-ключи: {exc}")
 
     # ── Очереди с приоритетом ─────────────────────────────────────
-    # RQ Worker обрабатывает очереди в порядке объявления:
-    # сначала все задачи из high_priority (личные), потом из coding_tasks
-    # (клиентские, Pay-As-You-Go). Один воркер, два канала.
-    queues = [
-        Queue("high_priority", connection=redis_conn),
-        Queue("coding_tasks", connection=redis_conn),
-    ]
+    # RQ Worker обрабатывает очереди в порядке объявления.
+    # Личный воркер (db 0): high_priority → coding_tasks.
+    # Публичный воркер (db 1): ТОЛЬКО coding_tasks (клиентские).
+    if is_public_worker:
+        queues = [
+            Queue("coding_tasks", connection=redis_conn),
+        ]
+    else:
+        queues = [
+            Queue("high_priority", connection=redis_conn),
+            Queue("coding_tasks", connection=redis_conn),
+        ]
 
     # ── Orphan cleanup: дочищаем ресурсы упавших задач ──────────
     try:
@@ -263,7 +283,9 @@ def start_worker() -> int:
         logger.warning(f"Orphan cleanup error: {exc}")
 
     # ── PID-файл для systemd / ручного контроля ──────────────────
-    PID_FILE = Path(PROJECT_ROOT / "rq_worker.pid")
+    # Изолирован по DB: rq_worker.pid (личный) / rq_worker.public.pid (публичный).
+    pid_name = "rq_worker.public.pid" if is_public_worker else "rq_worker.pid"
+    PID_FILE = Path(PROJECT_ROOT / pid_name)
     if PID_FILE.exists():
         try:
             old_pid = PID_FILE.read_text().strip()

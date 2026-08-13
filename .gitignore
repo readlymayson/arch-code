@@ -51,3 +51,4 @@ repomix-output.xml
 
 # Runtime artifacts
 rq_worker.pid
+rq_worker.public.pid

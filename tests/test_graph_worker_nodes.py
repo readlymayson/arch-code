@@ -36,10 +36,10 @@ from graph_worker import explore_project, execute_actions, run_tests, StateGraph
 # ── explore_project ─────────────────────────────────────────────
 
 class TestExploreProject:
-    """Узел исследования проекта."""
+    """Узел исследования проекта (детерминированный, без LLM)."""
 
-    def test_increments_iterations(self, mocker, temp_sandbox):
-        """iterations увеличивается на 1."""
+    def test_increments_iterations(self, temp_sandbox):
+        """iterations увеличивается на 1, project_context наполняется."""
         task_dir = str(temp_sandbox / "test_task_001")
         state = {
             "sandbox_dir": task_dir,
@@ -55,15 +55,15 @@ class TestExploreProject:
             "changed_files": [],
         }
 
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = "Понял, изучаю."
-
         result = explore_project(state)
         assert result["iterations"] == 1
         assert result["error"] == ""
+        # project_context наполнен детерминированной сводкой
+        assert result["project_context"]
+        assert "## Дерево" in result["project_context"]
 
-    def test_list_files_called(self, mocker, temp_sandbox):
-        """list_files вызывается с правильным sandbox_dir."""
+    def test_context_includes_tree(self, temp_sandbox):
+        """Дерево проекта попадает в project_context."""
         task_dir = str(temp_sandbox / "test_task_001")
         state = {
             "sandbox_dir": task_dir,
@@ -79,16 +79,69 @@ class TestExploreProject:
             "changed_files": [],
         }
 
-        mock_list = mocker.patch("graph_worker.list_files", return_value="app.js")
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = "ok"
+        result = explore_project(state)
+        summary = result["project_context"]
 
+        # Файлы песочницы попадают в карту проекта
+        assert "app.js" in summary
+        assert "package.json" in summary
+        assert "subdir/" in summary
+
+    def test_context_includes_python_signatures(self, tmp_path):
+        """AST-сигнатуры .py файлов попадают в project_context."""
+        py_dir = tmp_path / "py_project"
+        py_dir.mkdir()
+        (py_dir / "service.py").write_text(
+            'class Service:\n    """Сервис."""\n'
+            '    def run(self, name: str) -> str:\n        """Запуск."""\n        return name\n',
+            encoding="utf-8",
+        )
+        state = {
+            "sandbox_dir": str(py_dir),
+            "task": "Тест",
+            "iterations": 0,
+            "error": "",
+            "task_id": "test-sigs",
+            "project_dir": "/tmp/project",
+            "code": "",
+            "test_code": "",
+            "test_passed": False,
+            "success": False,
+            "changed_files": [],
+        }
+
+        result = explore_project(state)
+        summary = result["project_context"]
+
+        assert "class Service: ..." in summary
+        assert "def run(self, name: str) -> str: ..." in summary
+
+    def test_collects_context_fast(self, temp_sandbox):
+        """Сбор контекста занимает < 0.2 сек (DoD)."""
+        task_dir = str(temp_sandbox / "test_task_001")
+        state = {
+            "sandbox_dir": task_dir,
+            "task": "Тест",
+            "iterations": 0,
+            "error": "",
+            "task_id": "test-fast",
+            "project_dir": "/tmp/project",
+            "code": "",
+            "test_code": "",
+            "test_passed": False,
+            "success": False,
+            "changed_files": [],
+        }
+
+        import time
+        start = time.perf_counter()
         explore_project(state)
+        elapsed = time.perf_counter() - start
 
-        mock_list.assert_called_once_with(task_dir)
+        assert elapsed < 0.2, f"Сбор контекста занял {elapsed:.3f}с (> 0.2с)"
 
-    def test_empty_project(self, mocker, tmp_path):
-        """Пустой проект — не падает."""
+    def test_empty_project(self, tmp_path):
+        """Пустой проект — не падает, project_context присутствует."""
         empty_dir = str(tmp_path / "empty_sandbox")
         os.makedirs(empty_dir, exist_ok=True)
         state = {
@@ -105,11 +158,9 @@ class TestExploreProject:
             "changed_files": [],
         }
 
-        mock_llm = mocker.patch("graph_worker._get_llm")
-        mock_llm.return_value.invoke.return_value.content = "Проект пуст."
-
         result = explore_project(state)
         assert result["iterations"] == 1
+        assert "## Дерево" in result["project_context"]
 
 
 # ── execute_actions ─────────────────────────────────────────────
@@ -477,6 +528,22 @@ class TestDetectAppType:
     def test_no_entry_file(self, tmp_path):
         """Нет файла точки входа → cli_script (консервативно)."""
         import graph_worker
+        assert graph_worker.detect_app_type(str(tmp_path)) == "cli_script"
+
+    def test_comment_mention_not_web(self, tmp_path):
+        """Комментарий/docstring со словом FastAPI → НЕ web_app.
+
+        Регрессия: ai-core main.py содержит комментарий «Telemetry Server
+        (FastAPI sidecar)», но сам бот — не веб-приложение. Раньше это
+        давало ложное web_app → uvicorn main:app падал → задача failed.
+        """
+        import graph_worker
+        (tmp_path / "main.py").write_text(
+            '"""AI Core Assistant — личный бот."""\n'
+            '# Запускаем Telemetry Server (FastAPI sidecar)\n'
+            'import asyncio\n\n'
+            'async def main():\n    await asyncio.sleep(1)\n'
+        )
         assert graph_worker.detect_app_type(str(tmp_path)) == "cli_script"
 
 

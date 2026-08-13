@@ -599,13 +599,25 @@ class ProjectSandbox:
             # Отдельный файл — избегаем хрупкого экранирования shell.
             # ВАЖНО: network_mode="none" запрещает исходящие соединения,
             # но локальный HTTP внутри контейнера работает (loopback).
+            # Модуль приложения: ищем "app" в main.py, иначе пробуем
+            # web_app.py / app.py (агент мог положить ASGI-приложение туда).
             smoke_script = f'''import os, subprocess, sys, time, urllib.request, signal
+
+# Определяем модуль ASGI-приложения: main:app, иначе web_app:app / app:app
+asgi_module = "main:app"
+for cand in ("main.py", "web_app.py", "app.py"):
+    if os.path.isfile(cand):
+        with open(cand, "r", encoding="utf-8", errors="replace") as f:
+            src = f.read()
+        if "def app(" in src or "app = FastAPI(" in src or "app = Flask(" in src:
+            asgi_module = cand[:-3] + ":app"
+            break
 
 # PYTHONPATH передаётся ДОЧЕРНЕМУ процессу (uvicorn), т.к. sys.path
 # родителя не наследуется subprocess.
 env = dict(os.environ, PYTHONPATH="/app/.deps")
 proc = subprocess.Popen(
-    ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{health_port}"],
+    ["python", "-m", "uvicorn", asgi_module, "--host", "0.0.0.0", "--port", "{health_port}"],
     stdout=open("/tmp/app.log", "w"), stderr=subprocess.STDOUT, env=env,
 )
 try:

@@ -16,6 +16,7 @@ from langgraph.graph import END, StateGraph
 from loguru import logger
 
 from docker_manager import ProjectSandbox
+from core.context_inspector import ProjectContextInspector
 from tools.file_tools import list_files, make_coding_tools
 
 load_dotenv()
@@ -127,6 +128,8 @@ class AgentState(TypedDict):
     skip_smoke_test: bool # True → пропустить run_app (микро-задачи)
     health_endpoint: str  # путь health-check для web_app
     health_port: int      # порт health-check для web_app
+    # ── Контекст проекта (карта + AST-сигнатуры) ─────────────
+    project_context: str  # сводка ProjectContextInspector (~2000 токенов)
     # ── Подробности для панели мониторинга ───────────────────
     thought_steps: list   # структурированные мысли агента
     action_steps: list    # структурированные действия
@@ -167,51 +170,32 @@ def _sum_tokens(response: object) -> dict:
 # ── Узел: исследование проекта ──────────────────────────────────
 
 def explore_project(state: AgentState):
-    """Первый запуск: показать агенту структуру проекта."""
+    """Первый запуск: собрать карту проекта через ProjectContextInspector.
+
+    Вместо LLM-вызова (5-10 секунд + токены) использует детерминированный
+    инспектор: дерево каталогов + AST-сигнатуры классов/функций.
+    Результат пишется в state["project_context"] и пробрасывается
+    в system_prompt узла execute_actions.
+    """
     sandbox_dir = state["sandbox_dir"]
-    task = state["task"]
 
-    # Получаем дерево проекта
-    tree = list_files(sandbox_dir)
-
-    prompt = (
-        f"Ты — AI-разработчик. Твоя задача:\n{task}\n\n"
-        "Перед тобой — полная копия проекта. Изучи его структуру и файлы, "
-        "потом внеси необходимые изменения.\n\n"
-        "Текущая структура проекта:\n"
-        "─────────────────────────────────\n"
-        f"{tree}\n"
-        "─────────────────────────────────\n\n"
-        "ИНСТРУКЦИЯ ПО РАБОТЕ:\n"
-        "1. Сначала изучи структуру — она показана выше.\n"
-        "2. Прочитай нужные файлы через read_file().\n"
-        "3. Внеси изменения через write_file().\n"
-        "4. Когда закончишь, вызови done() с путями изменённых файлов.\n"
-        "5. НЕ выдумывай информацию — читай реальные файлы проекта.\n"
-        "6. НЕ трогай .env, конфиги с секретами.\n\n"
-        "Какие файлы тебе нужно прочитать для начала работы?"
-    )
-
-    response = _invoke_llm(_get_llm(), prompt, timeout=LLM_TIMEOUT)
-    thought = getattr(response, "content", str(response))[:500]
-    tokens = _sum_tokens(response)
+    # Детерминированный сбор контекста (pathlib + ast, без bash и LLM)
+    summary = ProjectContextInspector().generate_summary(sandbox_dir)
 
     ts = _now_iso()
-    thought_steps = state.get("thought_steps", []) + [
-        {"node": "explore", "thought": thought, "timestamp": ts},
-    ]
     action_steps = state.get("action_steps", []) + [
-        {"node": "explore", "action": f"Изучение структуры проекта ({len(tree)} строк)", "status": "completed", "timestamp": ts},
+        {"node": "explore", "action": f"Сбор карты проекта ({len(summary)} символов)", "status": "completed", "timestamp": ts},
     ]
 
     return {
         "error": "",
         "iterations": state["iterations"] + 1,
-        "thought_steps": thought_steps,
+        "project_context": summary,
+        "thought_steps": state.get("thought_steps", []),
         "action_steps": action_steps,
-        "chain_of_thought": state.get("chain_of_thought", "") + f"\n## Explore\n{thought}\n",
-        "prompt_tokens": state.get("prompt_tokens", 0) + tokens["prompt_tokens"],
-        "completion_tokens": state.get("completion_tokens", 0) + tokens["completion_tokens"],
+        "chain_of_thought": state.get("chain_of_thought", ""),
+        "prompt_tokens": state.get("prompt_tokens", 0),
+        "completion_tokens": state.get("completion_tokens", 0),
         "model": "deepseek/deepseek-v4-flash",
     }
 
@@ -247,9 +231,18 @@ def execute_actions(state: AgentState):
         if last_error else ""
     )
 
+    # Карта проекта от explore-узла (дерево + AST-сигнатуры)
+    project_context = state.get("project_context", "")
+    context_block = (
+        f"\n\n=== КАРТА ПРОЕКТА ===\n{project_context}\n=== КОНЕЦ КАРТЫ ===\n"
+        if project_context.strip()
+        else ""
+    )
+
     # ── Формируем system prompt ────────────────────────────────
     system_prompt = (
-        "Ты — AI-разработчик. Ты работаешь в fullstack-копии Python-проекта.\n\n"
+        "Ты — AI-разработчик. Ты работаешь в fullstack-копии Python-проекта."
+        f"{context_block}\n\n"
         "Твои инструменты:\n"
         "- read_file(relative_path) — прочитать файл\n"
         "- write_file(relative_path, content) — записать новый или перезаписать существующий файл\n"
@@ -473,10 +466,23 @@ _WEB_FRAMEWORK_KEYWORDS = (
 def detect_app_type(sandbox_dir: str) -> str:
     """Определить тип приложения: web_app или cli_script.
 
-    Читает main.py (или app.js) и ищет ключевые слова веб-фреймворков.
+    Читает main.py (или app.js) и ищет ПРИЗНАКИ веб-фреймворка:
+      - импорты (import fastapi / from flask import / require('express'))
+      - создание приложения (FastAPI(...), Flask(__name__), Express())
+      - запуск сервера (uvicorn.run, app.run(...), app.listen(...))
+
+    ВАЖНО: раньше матчились подстроки по всему файлу, включая комментарии
+    и строки документации. Для ai-core (копируется в песочницу, когда
+    project_dir=None) в main.py есть комментарий «Telemetry Server
+    (FastAPI sidecar)» — это давало ложное web_app, uvicorn main:app
+    падал, и задача помечалась failed, хотя код был корректный.
+    Теперь эвристика консервативная: реальный импорт или вызов.
+
     Если файл точки входа не найден или фреймворк не обнаружен —
     считаем CLI-скриптом (консервативная эвристика).
     """
+    import re
+
     entry_candidates = ["main.py", "app.py", "app.js", "server.js", "index.js"]
     main_content = ""
     for candidate in entry_candidates:
@@ -490,9 +496,39 @@ def detect_app_type(sandbox_dir: str) -> str:
                 logger.debug(f"detect_app_type: не удалось прочитать {candidate}: {exc}")
                 continue
 
-    lowered = main_content.lower()
-    if any(kw in lowered for kw in _WEB_FRAMEWORK_KEYWORDS):
+    if not main_content:
+        return "cli_script"
+
+    # Убираем комментарии и docstring-подобные строки, чтобы не ловить
+    # упоминания фреймворков в тексте (# ... / """ ... """).
+    # Приблизительно: строки, начинающиеся с #, и тройные кавычки.
+    no_comments = re.sub(
+        r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|#[^\n]*', "", main_content
+    )
+    lowered = no_comments.lower()
+
+    # Признаки реального использования веб-фреймворка:
+    # 1. Импорт: import fastapi / from fastapi import / import uvicorn
+    if re.search(r"^\s*import\s+(fastapi|flask|uvicorn|aiohttp|starlette|django|falcon)", lowered, re.M):
         return "web_app"
+    if re.search(r"^\s*from\s+(fastapi|flask|aiohttp|starlette|django)\s+import", lowered, re.M):
+        return "web_app"
+    # Node: require('express') / import express from
+    if re.search(r"require\s*\(\s*['\"](express|koa|fastify|hapi|restify)", lowered):
+        return "web_app"
+    if re.search(r"from\s+(express|koa|fastify|hapi)\s+import", lowered):
+        return "web_app"
+
+    # 2. Создание приложения: FastAPI(...), Flask(__name__), express()
+    if re.search(r"\b(fastapi|flask)\([^)]*\)", lowered):
+        return "web_app"
+    if re.search(r"\b(express|koa|fastify|hapi)\s*\(\s*\)", lowered):
+        return "web_app"
+
+    # 3. Запуск сервера: uvicorn.run, app.run(host=..., port=...), app.listen
+    if re.search(r"uvicorn\.run|uvicorn\.Config|app\.run\s*\(|app\.listen\s*\(", lowered):
+        return "web_app"
+
     return "cli_script"
 
 
