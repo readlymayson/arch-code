@@ -31,6 +31,19 @@ from loguru import logger
 from redis import Redis
 from rq import Worker, Queue
 
+# ── Windows-совместимость (2026-09-01) ─────────────────────────
+# RQ на Windows не поддерживает os.fork() (классический Worker
+# fork'ает work-horse процесс). SimpleWorker выполняет задачи
+# в том же процессе (без fork) — работает на Windows.
+# На Linux SimpleWorker тоже работает, но теряем изоляцию задач;
+# поэтому на Linux оставляем обычный Worker.
+import platform as _platform
+_IS_WINDOWS = _platform.system() == "Windows"
+
+if _IS_WINDOWS:
+    from rq.worker import SimpleWorker as Worker
+    logger.info("Windows: использую SimpleWorker (без fork)")
+
 
 def _setup_logger() -> None:
     logger.remove()
@@ -55,9 +68,18 @@ def _make_exception_handler(redis_conn):
     Возвращает функцию-обработчик, совместимую с RQ API.
     """
     def handler(job, exc_type, exc_value, exc_tb):
+        # Безопасное форматирование traceback: RQ 2.12 + Python 3.11 может
+        # кидать AttributeError внутри format_exception при cleanup
+        # (несовместимость traceback API). Ошибка НЕ должна ронять воркер.
+        try:
+            tb_text = "".join(
+                traceback.format_exception(exc_type, exc_value, exc_tb)
+            )
+        except Exception:
+            tb_text = f"{exc_type.__name__}: {exc_value}"
         logger.error(
             f"❌ Ошибка при выполнении задачи {job.id}: {exc_value}\n"
-            + "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            f"{tb_text}"
         )
         try:
             task_id = job.id

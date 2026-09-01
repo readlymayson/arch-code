@@ -1,11 +1,33 @@
 import asyncio
 import json
 import os
+import platform
 import shutil
 import subprocess
 import uuid
 
 from loguru import logger
+
+
+# ── Кроссплатформенная безопасность (2026-09-01) ────────────────
+# На Linux (VPS) контейнеры запускаются под user="1000:1000" — без прав
+# root внутри песочницы. На Windows/Docker Desktop (WSL2) user 1000:1000
+# тоже работает для Linux-контейнеров, НО volume-маунт Windows-пути
+# (C:\projects\arch-code\sandbox\...) отдаётся с правами WSL-пользователя —
+# chown 1000 внутри контейнера может не примениться, и процесс упадёт
+# с "Operation not permitted" при записи в /app.
+# Поэтому на Windows user НЕ задаём (контейнер работает от root внутри,
+# а права volume регулирует Docker Desktop/WSL2 сам).
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _run_user() -> str | None:
+    """Вернуть user для docker run (None → не задавать).
+
+    Linux: "1000:1000" (hardening).
+    Windows: None (Docker Desktop/WSL2 сам управляет правами volume).
+    """
+    return None if _IS_WINDOWS else "1000:1000"
 
 
 def cleanup_containers(task_id: str) -> None:
@@ -68,7 +90,7 @@ class NodeSandbox:
         Двухфазный запуск:
           1. npm install — контейнер с сетью (нужен npm registry).
           2. Основная команда — контейнер без сети (network_mode="none"),
-             с cap_drop=["ALL"] и user="1000:1000".
+             с cap_drop=["ALL"] и user=1000:1000 (Linux; на Windows — без user).
 
         Контейнер именуется sandbox-{task_id}, не удаляется автоматически
         (remove=False) — управление жизнью через cleanup_containers().
@@ -93,7 +115,7 @@ class NodeSandbox:
                 name=container_name,
                 volumes={self.sandbox_dir: {"bind": "/app", "mode": "rw"}},
                 working_dir="/app",
-                user="1000:1000",
+                user=_run_user(),
                 remove=True,
                 detach=False,
                 stderr=True,
@@ -116,7 +138,7 @@ class NodeSandbox:
                 volumes={self.sandbox_dir: {"bind": "/app", "mode": "rw"}},
                 working_dir="/app",
                 # Фаза исполнения — сетевая изоляция + безопасность
-                user="1000:1000",
+                user=_run_user(),
                 cap_drop=["ALL"],
                 network_mode="none",
                 security_opt=["no-new-privileges"],
@@ -196,8 +218,8 @@ class NodeSandbox:
             command: Команда для запуска.
             timeout: Таймаут (сек).
             no_network: True → фаза исполнения (network=none, cap_drop,
-                no-new-privileges, user=1000:1000). False → фаза установки
-                (npm install — нужна сеть).
+                no-new-privileges, user=1000:1000 на Linux; на Windows — без user).
+                False → фаза установки (npm install — нужна сеть).
         """
         volume_bind = f"{self.sandbox_dir}:/app"
         docker_cmd = [
@@ -210,8 +232,10 @@ class NodeSandbox:
                 "--network", "none",
                 "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges",
-                "--user", "1000:1000",
             ]
+            run_user = _run_user()
+            if run_user:
+                docker_cmd += ["--user", run_user]
         docker_cmd += ["node:alpine"] + command
 
         try:
@@ -262,12 +286,24 @@ class ProjectSandbox:
     """
 
     # Общие security-параметры для фазы исполнения (без сети)
+    # user=1000:1000 — только на Linux; на Windows не задаём (Docker Desktop).
     _RUN_SECURITY = {
         "user": "1000:1000",
         "cap_drop": ["ALL"],
         "network_mode": "none",
         "security_opt": ["no-new-privileges"],
     }
+
+    @staticmethod
+    def _run_security_params() -> dict:
+        """Параметры безопасности фазы исполнения (с учётом ОС)."""
+        params = dict(ProjectSandbox._RUN_SECURITY)
+        run_user = _run_user()
+        if run_user is None:
+            params.pop("user", None)
+        else:
+            params["user"] = run_user
+        return params
 
     @staticmethod
     def detect_project_type(sandbox_dir: str) -> str:
@@ -347,7 +383,7 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                user="1000:1000",
+                user=_run_user(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -376,7 +412,7 @@ class ProjectSandbox:
                 volumes=volumes,
                 working_dir="/app",
                 # Фаза исполнения — сетевая изоляция + безопасность
-                **ProjectSandbox._RUN_SECURITY,
+                **ProjectSandbox._run_security_params(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -426,7 +462,7 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                user="1000:1000",
+                user=_run_user(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -450,7 +486,7 @@ class ProjectSandbox:
                 volumes=volumes,
                 working_dir="/app",
                 # Фаза исполнения — сетевая изоляция + безопасность
-                **ProjectSandbox._RUN_SECURITY,
+                **ProjectSandbox._run_security_params(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -551,7 +587,7 @@ class ProjectSandbox:
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                user="1000:1000",
+                user=_run_user(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -662,7 +698,7 @@ print("OK")
                 volumes=volumes,
                 working_dir="/app",
                 # Фаза исполнения — сетевая изоляция + безопасность
-                **ProjectSandbox._RUN_SECURITY,
+                **ProjectSandbox._run_security_params(),
                 remove=False,
                 detach=False,
                 stderr=True,
@@ -773,7 +809,7 @@ setTimeout(async () => {{
                 name=container_name,
                 volumes=volumes,
                 working_dir="/app",
-                **ProjectSandbox._RUN_SECURITY,
+                **ProjectSandbox._run_security_params(),
                 remove=False,
                 detach=False,
                 stderr=True,

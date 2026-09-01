@@ -150,10 +150,41 @@ DEFAULT_SOURCE_PROJECT = os.path.normpath(os.path.join(PROJECT_ROOT, "..", "ai-c
 
 # ── Синхронизация проекта в песочницу ────────────────────────────
 
-def sync_project_to_sandbox(task_id: str, source_dir: str | None = None) -> str:
-    """Скопировать проект в sandbox/{task_id}/ через rsync.
+def _is_excluded_path(rel_path: str) -> bool:
+    """Проверить, исключён ли путь из копирования в sandbox.
 
-    Исключает .env, node_modules, venv, __pycache__, .git, logs и т.д.
+    Использует RSYNC_EXCLUDE_PATTERNS из tools/file_tools.py.
+    Работает для относительных путей с разделителями как '/' так и '\\'
+    (кроссплатформенно — Windows/POSIX).
+    """
+    import fnmatch
+
+    norm = rel_path.replace("\\", "/")
+    parts = norm.split("/")
+    for pattern in RSYNC_EXCLUDE_PATTERNS:
+        # Паттерн с слэшем — префикс-каталог ("logs/" или "temp/")
+        if pattern.endswith("/"):
+            if norm.startswith(pattern) or any(p == pattern.rstrip("/") for p in parts):
+                return True
+        # Паттерн с wildcard-звёздочками — fnmatch по полному пути и базы
+        elif any(ch in pattern for ch in "*?["):
+            if fnmatch.fnmatch(norm, pattern) or any(
+                fnmatch.fnmatch(p, pattern) for p in parts
+            ):
+                return True
+        else:
+            # Обычное имя — сравниваем с каждым компонентом пути
+            if any(p == pattern for p in parts):
+                return True
+    return False
+
+
+def sync_project_to_sandbox(task_id: str, source_dir: str | None = None) -> str:
+    """Скопировать проект в sandbox/{task_id}/ (кроссплатформенно).
+
+    Использует shutil.copytree с ignore-фильтром (RSYNC_EXCLUDE_PATTERNS)
+    вместо rsync — последний отсутствует в Windows. На Linux/POSIX
+    поведение эквивалентно старому rsync-варианту.
 
     Args:
         task_id: Уникальный ID задачи.
@@ -162,25 +193,42 @@ def sync_project_to_sandbox(task_id: str, source_dir: str | None = None) -> str:
     Returns:
         sandbox_dir: Абсолютный путь к песочнице.
     """
+    import shutil
+
     source = source_dir or DEFAULT_SOURCE_PROJECT
     sandbox_dir = os.path.join(PROJECT_ROOT, "sandbox", task_id)
 
-    # Создаём целевую папку
+    if not os.path.isdir(source):
+        raise RuntimeError(f"Исходный проект не найден: {source}")
+
+    # Создаём целевую папку (copytree требует отсутствия или пересоздания)
+    if os.path.exists(sandbox_dir):
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
     os.makedirs(sandbox_dir, exist_ok=True)
 
-    # Формируем --exclude для rsync
-    exclude_args = []
-    for pattern in RSYNC_EXCLUDE_PATTERNS:
-        exclude_args.extend(["--exclude", pattern])
-
-    cmd = ["rsync", "-a", "--quiet"] + exclude_args + [source + "/", sandbox_dir + "/"]
+    def _ignore(cur_dir: str, names: list[str]) -> set[str]:
+        """Фильтр исключений для shutil.copytree (по RSYNC_EXCLUDE_PATTERNS)."""
+        cur_abs = os.path.abspath(cur_dir)
+        base_abs = os.path.abspath(source)
+        ignored = set()
+        for name in names:
+            full = os.path.join(cur_dir, name)
+            rel = os.path.relpath(full, base_abs)
+            if _is_excluded_path(rel):
+                ignored.add(name)
+        return ignored
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"rsync превысил таймаут (120 с) при копировании {source}")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"rsync не удался: {e.stderr.decode() if e.stderr else e}")
+        shutil.copytree(
+            source,
+            sandbox_dir,
+            ignore=_ignore,
+            dirs_exist_ok=True,
+            # НЕ копируем симлинки как файлы (в ai-core есть симлинки на venv)
+            symlinks=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось скопировать проект в sandbox: {exc}")
 
     return sandbox_dir
 
@@ -226,6 +274,7 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
         subprocess.run(
             ["git", "add", "-A"],
             cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout,
         )
 
@@ -233,6 +282,7 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
         status_result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=sandbox_dir, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout,
         )
 
@@ -267,6 +317,7 @@ def compute_sandbox_diff(sandbox_dir: str) -> list[dict]:
             diff_result = subprocess.run(
                 ["git", "diff", "--cached", "HEAD", "--no-color", "--", filename],
                 cwd=sandbox_dir, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=timeout,
             )
 
@@ -399,23 +450,28 @@ def execute_coding_task_sync(
     try:
         subprocess.run(
             ["git", "init", "--initial-branch=main"],
-            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+            cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         subprocess.run(
             ["git", "config", "user.email", "arch-code@ai.local"],
-            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+            cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         subprocess.run(
             ["git", "config", "user.name", "Arch Code Agent"],
-            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+            cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         subprocess.run(
             ["git", "add", "-A"],
-            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+            cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         subprocess.run(
             ["git", "commit", "-m", "initial state before agent", "--allow-empty"],
-            cwd=sandbox_dir, check=True, capture_output=True, timeout=30,
+            cwd=sandbox_dir, check=True, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
     except subprocess.CalledProcessError as exc:
         stderr_detail = exc.stderr.decode(errors="replace") if exc.stderr else "(нет stderr)"
@@ -549,17 +605,25 @@ def execute_coding_task_sync(
         # 3. Вычисление git diff после работы агента
         # ═══════════════════════════════════════════════════════
 
-        changed_files = compute_sandbox_diff(sandbox_dir)
-
-        # ── Очистка __pycache__ из sandbox перед фиксацией результата ──
+        # ── Очистка тяжёлых каталогов из sandbox ПЕРЕД git diff ──
+        # Docker-песочница (ProjectSandbox._install_deps) ставит зависимости
+        # в /app/.deps и /app/node_modules (volume → sandbox). 24k файлов
+        # .deps ломают git add -A (таймаут 30с) и раздувают diff/ZIP.
+        # Удаляем их до compute_sandbox_diff — они всё равно исключены
+        # из результата (RSYNC_EXCLUDE_PATTERNS / _EXCLUDED_DIFF_DIRS).
         try:
             import shutil as _shutil
             for _root, _dirs, _files in os.walk(sandbox_dir):
-                if "__pycache__" in _dirs:
-                    _shutil.rmtree(os.path.join(_root, "__pycache__"), ignore_errors=True)
-                    _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+                for _heavy in (".deps", "node_modules", "__pycache__", ".venv", "venv"):
+                    if _heavy in _dirs:
+                        _shutil.rmtree(
+                            os.path.join(_root, _heavy), ignore_errors=True
+                        )
+                        _dirs[:] = [d for d in _dirs if d != _heavy]
         except Exception as exc:
-            logger.warning(f"Ошибка очистки __pycache__ в sandbox: {exc}")
+            logger.warning(f"Ошибка очистки тяжёлых каталогов в sandbox: {exc}")
+
+        changed_files = compute_sandbox_diff(sandbox_dir)
 
         # ── Валидация синтаксиса изменённых Python-файлов ────────────
         validation_errors = []
@@ -588,8 +652,19 @@ def execute_coding_task_sync(
         # 4. Сборка deliverable (zip) ДО очистки sandbox
         #    Использует changed_files[].content — работает даже после
         #    удаления песочницы (cleanup в finally).
+        #
+        #    ВАЖНО (кроссплатформенный режим, 2026-09-01): воркер может
+        #    работать на Windows (ПК), а ai-core — на VPS. ZIP-файл на
+        #    локальном диске Windows НЕДОСТУПЕН ai-core. Поэтому архив
+        #    дополнительно читается в base64 и кладётся в результат
+        #    (deliverable_b64) — ai-core сохранит его на VPS. Поле
+        #    deliverable_path остаётся для обратной совместимости
+        #    (локальный файл; на Windows он не используется ai-core).
         # ═══════════════════════════════════════════════════════
+        import base64 as _b64
+
         deliverable_path = None
+        deliverable_b64 = None
         try:
             from tools.deliverable_builder import build_zip
 
@@ -604,6 +679,9 @@ def execute_coding_task_sync(
                     else "Решение не завершено полностью (см. лог)."
                 ),
             )
+            if deliverable_path and os.path.isfile(deliverable_path):
+                with open(deliverable_path, "rb") as _zf:
+                    deliverable_b64 = _b64.b64encode(_zf.read()).decode("ascii")
         except Exception as zip_exc:
             logger.warning(f"Deliverable: не удалось собрать архив: {zip_exc}")
 
@@ -616,6 +694,7 @@ def execute_coding_task_sync(
                 changed_files=changed_files,
                 generated_files_dir=sandbox_path,
                 deliverable_path=deliverable_path,
+                deliverable_b64=deliverable_b64,
                 log=f"Код успешно сгенерирован. Изменено файлов: {len(changed_files)}.",
             )
         else:
@@ -652,6 +731,7 @@ def execute_coding_task_sync(
                 iterations=final_state.get("iterations"),
                 changed_files=changed_files,
                 deliverable_path=deliverable_path,
+                deliverable_b64=deliverable_b64,
                 error=err_msg,
                 error_traceback=err_tb,
             )
