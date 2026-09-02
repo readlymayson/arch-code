@@ -8,9 +8,10 @@
 Роль в новой архитектуре (2026-09-01):
 - SPA-биржи (Kwork и др.) требуют реального браузера (Playwright) —
   на VPS это дорого/нестабильно, поэтому скрейпер переезжает на ПК.
-- Заказы публикуются в Redis LIST `freelance_exchange:orders` (LPUSH)
+- Заказы публикуются в Redis LIST `freelance:remote:orders` (LPUSH)
   в формате JSON (FreelanceOrder.to_json + raw_text + source meta).
-- ai-core (VPS) в remote_mode читает список через BRPOP и передаёт
+- ai-core (VPS) в remote_mode читает список через LRANGE+LTRIM
+  (ExchangePlaywrightReceiver, remote_list_key) и передаёт
   заказы в тот же конвейер (дедуп → ключевые слова → LLM).
 
 Запуск:
@@ -45,8 +46,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(AI_CORE_ROOT / ".env", override=False)
 
 # ── Redis-ключи (общие с ai-core remote_mode) ───────────────────
-REDIS_ORDERS_LIST = "freelance_exchange:orders"   # LPUSH/BRPOP
-REDIS_ORDERS_CHANNEL = "freelance_exchange:orders:channel"  # Pub/Sub
+# ВАЖНО: ключ LIST должен совпадать с remote_list_key в ai-core
+# ExchangePlaywrightReceiver (core/freelance_exchange_scraper.py:930).
+# См. также REMOTE_WINDOWS.md — там задокументирован этот же ключ.
+REDIS_ORDERS_LIST = "freelance:remote:orders"   # LPUSH (VPS) / LRANGE+LTRIM (ai-core)
+REDIS_ORDERS_CHANNEL = "freelance_exchange:orders:channel"  # Pub/Sub (оповещения)
 
 
 def _setup_logger() -> None:

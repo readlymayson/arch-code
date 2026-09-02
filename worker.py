@@ -147,6 +147,46 @@ PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 # По умолчанию — ai-core (рядом в /home/dev/projects/ai-core)
 DEFAULT_SOURCE_PROJECT = os.path.normpath(os.path.join(PROJECT_ROOT, "..", "ai-core"))
 
+def _materialize_scaffold_files(sandbox_dir: str, scaffold_files: Dict[str, str]) -> int:
+    """Материализовать файлы scaffold (переданные через Redis) в песочницу.
+
+    OrderExecutor на VPS создаёт scaffold, но remote-воркеру (Windows)
+    путь VPS недоступен — файлы доезжают внутри job kwargs.
+
+    Args:
+        sandbox_dir: Абсолютный путь к песочнице.
+        scaffold_files: {"relative/path": "content"} — пути относительные,
+            защищены от path traversal (запрет '..' и абсолютных путей).
+
+    Returns:
+        Число записанных файлов.
+    """
+    written = 0
+    for rel_path, content in (scaffold_files or {}).items():
+        # Безопасность: только относительные пути без '..'
+        norm = os.path.normpath(rel_path)
+        if os.path.isabs(norm) or norm.startswith(".."):
+            logger.warning(f"Scaffold: пропущен небезопасный путь {rel_path!r}")
+            continue
+        target = os.path.join(sandbox_dir, norm)
+        # Двойная проверка: target внутри sandbox
+        if not os.path.abspath(target).startswith(os.path.abspath(sandbox_dir) + os.sep):
+            logger.warning(f"Scaffold: пропущен путь вне sandbox {rel_path!r}")
+            continue
+        try:
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            written += 1
+        except Exception as exc:
+            logger.warning(f"Scaffold: не удалось записать {rel_path!r}: {exc}")
+    logger.info(
+        f"Scaffold: материализовано {written}/{len(scaffold_files or {})} файлов в sandbox"
+    )
+    return written
+
 
 # ── Синхронизация проекта в песочницу ────────────────────────────
 
@@ -390,6 +430,7 @@ def execute_coding_task_sync(
     test_code: Optional[str] = None,
     project_dir: Optional[str] = None,
     skip_smoke_test: bool = False,
+    scaffold_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Атомарный запуск цикла генерации кода (синхронная версия).
 
@@ -398,8 +439,16 @@ def execute_coding_task_sync(
         task_id: Уникальный ID (если не задан — генерируется).
         test_code: Опциональный тестовый скрипт (node:test).
         project_dir: Путь к проекту для копирования в sandbox.
+            Remote-воркер (Windows): пути VPS-хоста здесь НЕ существуют —
+            в этом случае используется локальная копия ai-core
+            (DEFAULT_SOURCE_PROJECT, ../ai-core относительно arch-code).
         skip_smoke_test: True → пропустить smoke-проверку приложения
             (для микро-задач без точки входа main.py — экономия 15-20 сек).
+        scaffold_files: Опциональный словарь {"relative/path": "content"} —
+            файлы scaffold, переданные через Redis (OrderExecutor на VPS
+            создаёт scaffold, но путь VPS недоступен remote-воркеру).
+            Если задан — scaffold материализуется в sandbox ВМЕСТО
+            копирования project_dir (гибрид: пустой sandbox + файлы).
 
     Returns:
         Dict с ключами:
@@ -431,10 +480,34 @@ def execute_coding_task_sync(
     # ═══════════════════════════════════════════════════════════
     # 1b. Синхронизация проекта в песочницу
     # ═══════════════════════════════════════════════════════════
-
+    # Remote-режим: project_dir может указывать на путь, которого нет
+    # на этом хосте (scaffold/проект живут на VPS). Стратегия:
+    #   1. scaffold_files задан → материализуем файлы в sandbox
+    #      (плюс база: локальная копия ai-core, если project_dir не найден);
+    #   2. project_dir существует локально → обычное копирование;
+    #   3. иначе → fallback на локальную копию ai-core (DEFAULT_SOURCE_PROJECT).
     try:
         _update_job_meta(current_step="sync", progress=5, iteration=0)
-        sandbox_dir = sync_project_to_sandbox(actual_task_id, project_dir)
+
+        project_dir_local = project_dir if (project_dir and os.path.isdir(project_dir)) else None
+        if project_dir and not project_dir_local:
+            logger.warning(
+                f"project_dir не существует на этом хосте "
+                f"({project_dir!r}) — remote-воркер: "
+                f"используется локальная копия ai-core "
+                f"({DEFAULT_SOURCE_PROJECT})"
+            )
+
+        if scaffold_files:
+            # Гибрид: база (project_dir или локальный ai-core) + файлы scaffold
+            sandbox_dir = sync_project_to_sandbox(
+                actual_task_id, project_dir_local or DEFAULT_SOURCE_PROJECT
+            )
+            _materialize_scaffold_files(sandbox_dir, scaffold_files)
+        else:
+            sandbox_dir = sync_project_to_sandbox(
+                actual_task_id, project_dir_local or DEFAULT_SOURCE_PROJECT
+            )
     except Exception as exc:
         return _make_result(
             "error",
